@@ -409,6 +409,22 @@ impl Storage for File {
 
 #[maybe_async]
 impl File {
+    /// Use an existing file with explicitly known open options.
+    ///
+    /// The filename is not used to reopen the file, but is retained to resolve relative paths.
+    /// The writable and direct I/O options must match how the file was opened.
+    pub fn from_open_file(file: fs::File, opts: StorageOpenOptions) -> io::Result<Self> {
+        Self::new(
+            file,
+            opts.filename,
+            opts.direct,
+            #[cfg(unix)]
+            opts.writable,
+            #[cfg(target_os = "macos")]
+            opts.relaxed_sync,
+        )
+    }
+
     /// Central internal function to create a `File` object.
     fn new(
         mut file: fs::File,
