@@ -394,34 +394,35 @@ impl<S: Storage> Allocator<S> {
             assert!(new_rt.in_bounds(rt_index));
 
             let rt_entry = new_rt.get(rt_index);
-            let Some(rb_offset) = rt_entry.refblock_offset() else {
-                let start_index = HostCluster::from_ref_indices(rt_index, 0, rb_bits);
+            if let Some(rb_offset) = rt_entry.refblock_offset() {
+                let rb_cluster = rb_offset.checked_cluster(cb).ok_or_else(|| {
+                    invalid_data(format!(
+                        "Unaligned refcount block with index {rt_index}; refcount table entry: {rt_entry:?}"
+                    ))
+                })?;
+
+                let rb = self.caches.rb_get_or_insert(rb_cluster).await?;
+                for i in rb_index..rb_entries {
+                    if rb.is_zero(i) {
+                        let index = HostCluster::from_ref_indices(rt_index, i, rb_bits);
+                        free_cluster_index.get_or_insert(index);
+                        free_cluster_count += ClusterCount(1);
+
+                        if free_cluster_count >= required_clusters {
+                            break;
+                        }
+                    } else if free_cluster_index.is_some() {
+                        free_cluster_index.take();
+                        free_cluster_count = ClusterCount(0);
+                        required_clusters = rt_clusters; // reset
+                    }
+                }
+            } else {
+                let start_index = HostCluster::from_ref_indices(rt_index, rb_index, rb_bits);
                 free_cluster_index.get_or_insert(start_index);
-                free_cluster_count += ClusterCount(rb_entries as u64);
+                free_cluster_count += ClusterCount((rb_entries - rb_index) as u64);
                 // Need to allocate this RB
                 required_clusters += ClusterCount(1);
-                continue;
-            };
-
-            let rb_cluster = rb_offset.checked_cluster(cb).ok_or_else(|| {
-                invalid_data(format!("Unaligned refcount block with index {rt_index}; refcount table entry: {rt_entry:?}"))
-            })?;
-
-            let rb = self.caches.rb_get_or_insert(rb_cluster).await?;
-            for i in rb_index..rb_entries {
-                if rb.is_zero(i) {
-                    let index = HostCluster::from_ref_indices(rt_index, i, rb_bits);
-                    free_cluster_index.get_or_insert(index);
-                    free_cluster_count += ClusterCount(1);
-
-                    if free_cluster_count >= required_clusters {
-                        break;
-                    }
-                } else if free_cluster_index.is_some() {
-                    free_cluster_index.take();
-                    free_cluster_count = ClusterCount(0);
-                    required_clusters = rt_clusters; // reset
-                }
             }
 
             rb_index = 0;
