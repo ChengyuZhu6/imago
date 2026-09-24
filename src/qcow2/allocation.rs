@@ -544,3 +544,144 @@ impl<S: Storage> Allocator<S> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::null::Null;
+
+    /// Regression test for a bug in `Allocator::grow_reftable()`'s free-space search loop: when it
+    /// hit a reftable index that had no refblock at all (i.e. a range that has never been
+    /// allocated), it `continue`d without advancing `rt_index` (the increment happened only at the
+    /// bottom of the `while` loop, which the `continue` skipped). If a single iteration wasn't
+    /// enough to satisfy `required_clusters` (which happens once the *total* size of the freshly
+    /// grown reftable reaches or exceeds one refblock's cluster coverage), the loop revisited the
+    /// very same unmapped index again and again, adding its whole refblock-sized range to the
+    /// free-space count each time. This inflated the apparent free space far beyond what was
+    /// actually free starting at that index, so the subsequent "mark allocated" step walked past
+    /// the single truly free refblock-range and right into the next reftable index -- which can be
+    /// a real, already-in-use refblock -- and incremented its refcounts without ever checking they
+    /// were zero. That silently claimed an already-allocated cluster for the new reftable
+    /// structure.
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_grow_reftable_keeps_in_use_refblock() {
+        // Minimal cluster size and maximal refcount width shrink one refblock's cluster coverage
+        // (and also one reftable cluster's entry count) down to 64, so we don't need a huge image
+        // to reach "new reftable total size >= one refblock's coverage".
+        let cluster_bits = 9u32; // 512-byte clusters
+        let refcount_order = 6u32; // 64-bit refcounts
+        let header = Arc::new(Header::new(cluster_bits, refcount_order, None, None, None));
+        let rb_bits = header.rb_bits();
+        let rb_entries = header.rb_entries();
+        assert_eq!(rb_bits, 6);
+        assert_eq!(rb_entries, 64);
+
+        let null = Arc::new(Null::new(1 << 30));
+        let caches = Arc::new(MetadataCaches::new(&null, &header, 128, 32));
+
+        // We will create two refblocks, one at RT index 4093 (cluster 261952), the other at RT
+        // index 4095 (cluster 262080), the first one completely set (all refcounts 1), the second
+        // one only having its first two entries set (to 1).
+        // Therefore:
+        // - Clusters 261952..=262015 are occupied
+        // - Clusters 262016..=262079 are free
+        // - Clusters 262080..=262081 are occupied
+        // - Rest is free
+        //
+        // The reftable has 4096 entries (to cover everything up to index 4095), thus would need 64
+        // clusters if it were stored anywhere. We ask it to grow to cover index 4096, which
+        // `clone_and_grow()` rounds up to full clusters, i.e. 4160 entries, so 65 clusters, which
+        // does not fit into the 64-cluster long 262016..=262079 range. If we are to put it
+        // at 262082..=262146, then that would go beyond the range of refblock B (262080..=262143),
+        // so we also need a refblock for this range, at RT index 4096. The reftable growth
+        // algorithm puts the new refblocks and the reftable together, so it goes into cluster
+        // 262082, and the reftable starts at cluster 262083 (range 262083..=262147).
+
+        // RB_A: a fully-used refblock at rt_index 4093, where the free-space search starts. It has
+        // no free clusters, so the search legitimately advances to rt_index 4094.
+        let rt_index_a = 4093usize;
+        let rb_a_cluster = HostCluster((rt_index_a * rb_entries) as u64);
+        let mut rb_a = RefBlock::new_cleared(null.as_ref(), &header).unwrap();
+        rb_a.set_cluster(rb_a_cluster);
+        {
+            let mut g = rb_a.lock_write().await;
+            for i in 0..rb_entries {
+                g.increment(i).unwrap();
+            }
+        }
+        let rb_a = Arc::new(rb_a);
+        caches
+            .rb_insert(rb_a_cluster, Arc::clone(&rb_a))
+            .await
+            .unwrap();
+
+        // rt_index 4094 intentionally has no refblock at all: it is a genuinely unmapped, fully
+        // free range.
+
+        // RB_B: the "victim" refblock at rt_index 4095, representing clusters that are already
+        // genuinely allocated (e.g. real guest data/metadata clusters elsewhere in the image).
+        let rt_index_b = 4095usize;
+        let rb_b_cluster = HostCluster((rt_index_b * rb_entries) as u64);
+        let mut rb_b = RefBlock::new_cleared(null.as_ref(), &header).unwrap();
+        rb_b.set_cluster(rb_b_cluster);
+        {
+            let mut g = rb_b.lock_write().await;
+            g.increment(0).unwrap();
+            g.increment(1).unwrap();
+        }
+        let rb_b = Arc::new(rb_b);
+        caches
+            .rb_insert(rb_b_cluster, Arc::clone(&rb_b))
+            .await
+            .unwrap();
+
+        // Build the (old) reftable: entries up to (and including) rt_index_b, with only
+        // rt_index_a and rt_index_b actually mapped to a refblock.
+        let mut data = vec![RefTableEntry::default(); rt_index_b + 1];
+        data[rt_index_a] = <RefTableEntry as TableEntry>::try_from_plain(
+            rb_a_cluster.offset(cluster_bits).0,
+            &header,
+        )
+        .unwrap();
+        data[rt_index_b] = <RefTableEntry as TableEntry>::try_from_plain(
+            rb_b_cluster.offset(cluster_bits).0,
+            &header,
+        )
+        .unwrap();
+        let old_reftable = RefTable::from_data(data.into_boxed_slice(), &header);
+
+        let mut allocator = Allocator {
+            file: Arc::clone(&null),
+            reftable: old_reftable,
+            first_free_cluster: rb_a_cluster,
+            header: Arc::clone(&header),
+            caches: Arc::clone(&caches),
+        };
+
+        // Trigger reftable growth just one index beyond the current bound.
+        allocator.grow_reftable(rt_index_b + 1).await.unwrap();
+
+        // RB_B's clusters were already allocated (refcount 1 each) before the grow, and must
+        // remain untouched by this unrelated reftable-growth operation.
+        assert_eq!(
+            rb_b.get(0),
+            1,
+            "cluster already in use had its refcount corrupted by grow_reftable()"
+        );
+        assert_eq!(
+            rb_b.get(1),
+            1,
+            "cluster already in use had its refcount corrupted by grow_reftable()"
+        );
+
+        // Also verify the reftable is where it is expected, three clusters after the start of what
+        // refblock B describes (the first cluster is B itself, the second is marked as allocated
+        // just like so, and the third is the new refblock at RT index 4096, allocated because the
+        // reftable goes across two refblocks).
+        assert_eq!(
+            allocator.reftable.get_cluster(),
+            Some(HostCluster((rt_index_b * rb_entries + 3) as u64)),
+            "reftable should be placed after refblock B"
+        );
+    }
+}
