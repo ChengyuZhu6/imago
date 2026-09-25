@@ -332,18 +332,22 @@ impl<S: Storage + 'static> FormatAccess<S> {
     ///
     /// If `overwrite` is true, the contents in the range are supposed to be overwritten and may be
     /// discarded.  Otherwise, they are kept.
+    ///
+    /// Reaching the end of file before the end of the range results in an error.
     pub async fn ensure_data_mapping(
         &self,
         offset: u64,
         length: u64,
         overwrite: bool,
     ) -> io::Result<(&S, u64, u64)> {
+        self.check_disk_bounds(offset, length, "allocate")?;
+
         let (storage, mapped_offset, mapped_length) = self
             .inner
             .ensure_data_mapping(offset, length, overwrite)
             .await?;
         let mapped_length = cmp::min(length, mapped_length);
-        assert!(mapped_length > 0);
+        assert!(length == 0 || mapped_length > 0);
         Ok((storage, mapped_offset, mapped_length))
     }
 
