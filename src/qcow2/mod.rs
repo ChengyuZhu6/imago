@@ -24,7 +24,7 @@ use crate::misc_helpers::{invalid_data, ResultErrorContext};
 use crate::raw::Raw;
 use crate::sync_primitives::{Mutex, RwLock};
 use crate::{storage, FormatAccess, ShallowMapping, Storage, StorageExt, StorageOpenOptions};
-use allocation::{Allocator, ClustersToFreeList};
+use allocation::{Allocator, ClustersToFreeEntry, ClustersToFreeList};
 pub use builder::{Qcow2CreateBuilder, Qcow2OpenBuilder};
 use cache::MetadataCaches;
 use mappings::FixedMapping;
@@ -584,6 +584,8 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
     }
 
     async fn flush(&self) -> io::Result<()> {
+        // Free what is pending before writing back the refblocks
+        self.process_clusters_to_free().await;
         self.caches.flush_all().await?;
         self.metadata.flush().await?;
         if let Some(storage) = self.storage.as_ref() {

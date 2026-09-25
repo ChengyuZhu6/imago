@@ -58,6 +58,15 @@ impl ClustersToFreeEntry {
             metadata: false,
         }
     }
+
+    /// Create an entry for the given range of metadata clusters.
+    pub fn metadata(first_cluster: HostCluster, count: ClusterCount) -> Self {
+        ClustersToFreeEntry {
+            first_cluster,
+            count,
+            metadata: true,
+        }
+    }
 }
 
 /// Central facility for cluster allocation.
@@ -168,16 +177,6 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
                 .await?
                 .then_some(mandatory_host_cluster);
             Ok(cluster)
-        }
-    }
-
-    /// Free metadata clusters (i.e. decrement their refcount).
-    ///
-    /// Best-effort operation.  On error, the given clusters may be leaked, but no errors are ever
-    /// returned (because there is no good way to handle such errors anyway).
-    pub(super) async fn free_meta_clusters(&self, cluster: HostCluster, count: ClusterCount) {
-        if let Ok(mut allocator) = self.allocator().await {
-            allocator.free_clusters(cluster, count).await
         }
     }
 
@@ -348,7 +347,9 @@ impl<S: Storage> Allocator<S> {
 
             let result = self.allocate_cluster_at(index).await;
             if !matches!(result, Ok(true)) {
-                // Already allocated, or some real error occurred; free everything allocated so far
+                // Already allocated, or some real error occurred; free everything allocated so far.
+                // Do not go through `self.clusters_to_free`: As described above, the freed range
+                // must be available for allocation immediately, so that retrying converges.
                 self.free_clusters(start_index, index - start_index).await;
                 return result.map(|_| index - start_index);
             }
@@ -578,12 +579,16 @@ impl<S: Storage> Allocator<S> {
             .write_reftable_pointer(self.file.as_ref())
             .await?;
 
-        // Must set new reftable before calling `free_clusters()`
+        // Must set new reftable before freeing the old reftable’s clusters
         let mut old_reftable = mem::replace(&mut self.reftable, new_rt);
         if let Some(old_rt_cluster) = old_reftable.get_cluster() {
             let old_rt_size = old_reftable.cluster_count();
             old_reftable.unset_cluster();
-            self.free_clusters(old_rt_cluster, old_rt_size).await;
+            // Do not run `process_clusters_to_free()` here: We are in the middle of allocating
+            // clusters, and that function would flip the L2-RB cache dependency. Our caller will
+            // drain the list eventually.
+            self.clusters_to_free
+                .push(ClustersToFreeEntry::metadata(old_rt_cluster, old_rt_size));
         }
 
         Ok(())

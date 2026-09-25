@@ -290,8 +290,11 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
         // Free old L2 table, if any
         if let Some(l2_offset) = l1_entry.l2_offset() {
-            self.free_meta_clusters(l2_offset.cluster(cb), ClusterCount(1))
-                .await;
+            self.clusters_to_free.push(ClustersToFreeEntry::metadata(
+                l2_offset.cluster(cb),
+                ClusterCount(1),
+            ));
+            self.process_clusters_to_free().await;
         }
 
         let l2_table = Arc::new(l2_table);
@@ -324,7 +327,9 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         if let Some(old_l1_cluster) = l1_locked.get_cluster() {
             let old_l1_size = l1_locked.cluster_count();
             l1_locked.unset_cluster();
-            self.free_meta_clusters(old_l1_cluster, old_l1_size).await;
+            self.clusters_to_free
+                .push(ClustersToFreeEntry::metadata(old_l1_cluster, old_l1_size));
+            self.process_clusters_to_free().await;
         }
 
         *l1_locked = new_l1;
