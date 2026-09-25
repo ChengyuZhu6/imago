@@ -8,6 +8,7 @@ use crate::format::builder::{
 use crate::format::drivers::FormatDriverInstance;
 use crate::format::gate::ImplicitOpenGate;
 use crate::format::{Format, PreallocateMode};
+use crate::sync_primitives::{Mutex, MutexGuard};
 use crate::{
     storage, DenyImplicitOpenGate, ShallowMapping, Storage, StorageExt, StorageOpenOptions,
 };
@@ -27,7 +28,17 @@ pub struct Raw<S: Storage + 'static> {
     writable: bool,
 
     /// Disk size, which is the file size when this object was created.
+    ///
+    /// Copy of the value in `resize_lock`, for lock-free reading.  Must only be changed via
+    /// [`Raw::set_size()`].
     size: AtomicU64,
+
+    /// Disk size, for resize operations.
+    ///
+    /// Every resize path (growing and shrinking) must hold this lock throughout, and change the
+    /// size only via [`Raw::set_size()`].  This serializes resizes, so a resize to a smaller size
+    /// cannot overtake one to a larger size and shrink the storage below the image size.
+    resize_lock: Mutex<u64>,
 }
 
 #[maybe_async]
@@ -54,6 +65,7 @@ impl<S: Storage + 'static> Raw<S> {
             inner,
             writable,
             size: size.into(),
+            resize_lock: Mutex::new(size),
         })
     }
 
@@ -72,6 +84,7 @@ impl<S: Storage + 'static> Raw<S> {
             inner,
             writable,
             size: size.into(),
+            resize_lock: Mutex::new(size),
         })
     }
 
@@ -81,6 +94,15 @@ impl<S: Storage + 'static> Raw<S> {
         tokio::runtime::Builder::new_current_thread()
             .build()?
             .block_on(Self::open_path(path, writable))
+    }
+
+    /// Set the disk size.
+    ///
+    /// Requires the guard of `resize_lock`, which must be held throughout the whole resize
+    /// operation.
+    fn set_size(&self, size_guard: &mut MutexGuard<'_, u64>, new_size: u64) {
+        **size_guard = new_size;
+        self.size.store(new_size, Ordering::Relaxed);
     }
 }
 
@@ -230,14 +252,8 @@ impl<S: Storage + 'static> FormatDriverInstance for Raw<S> {
         new_size: u64,
         format_prealloc_mode: PreallocateMode,
     ) -> io::Result<()> {
-        #[allow(deprecated)]
-        if self
-            .size
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-                (new_size > old).then_some(new_size)
-            })
-            .is_err()
-        {
+        let mut size_guard = self.resize_lock.lock().await;
+        if new_size <= *size_guard {
             return Ok(()); // only grow, else do nothing
         }
 
@@ -249,24 +265,35 @@ impl<S: Storage + 'static> FormatDriverInstance for Raw<S> {
             PreallocateMode::FullAllocate => storage::PreallocateMode::Allocate,
             PreallocateMode::WriteData => storage::PreallocateMode::WriteData,
         };
-        self.inner.resize(new_size, storage_prealloc_mode).await
+
+        // Grow the storage first, so the image never extends beyond it
+        self.inner.resize(new_size, storage_prealloc_mode).await?;
+
+        self.set_size(&mut size_guard, new_size);
+        Ok(())
     }
 
     async fn resize_shrink(&mut self, new_size: u64) -> io::Result<()> {
-        #[allow(deprecated)]
-        if self
-            .size
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-                (new_size < old).then_some(new_size)
-            })
-            .is_err()
-        {
+        // Not strictly necessary with `&mut self`, but ensures all resize paths look the same
+        let mut size_guard = self.resize_lock.lock().await;
+        let old_size = *size_guard;
+        if new_size >= old_size {
             return Ok(()); // only shrink, else do nothing
         }
 
-        self.inner
+        // Shrink the image first, so it never extends beyond the storage
+        self.set_size(&mut size_guard, new_size);
+
+        if let Err(err) = self
+            .inner
             .resize(new_size, storage::PreallocateMode::None)
             .await
+        {
+            self.set_size(&mut size_guard, old_size);
+            return Err(err);
+        }
+
+        Ok(())
     }
 }
 
