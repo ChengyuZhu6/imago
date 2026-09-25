@@ -289,7 +289,7 @@ impl<S: Storage + 'static> FormatAccess<S> {
                 } => {
                     format_layer = recurse_layer;
                     offset = recurse_offset;
-                    writable_gate = recurse_writable;
+                    writable_gate = writable_gate && recurse_writable;
                     max_length = length;
                 }
 
