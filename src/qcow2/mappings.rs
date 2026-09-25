@@ -503,3 +503,84 @@ pub(super) enum FixedMapping {
     /// example by requiring mutable access to the `Qcow2` object.
     FullDiscard,
 }
+
+#[cfg(test)]
+mod tests {
+    //! Tests for establishing mappings.
+
+    use super::*;
+    use crate::format::drivers::FormatDriverInstance;
+    use crate::test::mem_storage::{MemStorage, MemStorageState};
+    use crate::{DenyImplicitOpenGate, Mapping};
+
+    /// Create a 512-byte-cluster image of the given size and refcount width on a [`MemStorage`]
+    /// with the given state.
+    #[maybe_async]
+    async fn create_image(
+        state: &Arc<MemStorageState>,
+        size: u64,
+        refcount_width: usize,
+    ) -> Qcow2<MemStorage> {
+        Qcow2::<MemStorage>::create_builder(MemStorage::new(Arc::clone(state), false))
+            .cluster_size(512)
+            .refcount_width(refcount_width)
+            .size(size)
+            .create_open(DenyImplicitOpenGate::default(), |image| {
+                Ok(Qcow2::<MemStorage>::builder(image)
+                    .backing(None)
+                    .write(true))
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Fully discarding (to the backing file) must work on qcow2 v2 images, too, because it only
+    /// requires setting L2 entries to 0.
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_full_discard_v2() {
+        // Create a v3 image, then turn it into a v2 image: A v2 header is the same, except for the
+        // version, and all v3 fields having their default values (which imago creates by default,
+        // e.g. 16-bit refcounts)
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = create_image(&state, 64 * 1024, 16).await;
+        qcow2.flush().await.unwrap();
+        drop(qcow2);
+        state.data.lock().unwrap()[4..8].copy_from_slice(&2u32.to_be_bytes());
+
+        let qcow2 = Qcow2::<MemStorage>::builder(MemStorage::new(state, false))
+            .backing(None)
+            .write(true)
+            .open(DenyImplicitOpenGate::default())
+            .await
+            .unwrap();
+        qcow2.header.require_version(2).unwrap();
+        qcow2.header.require_version(3).unwrap_err();
+        let mut image = FormatAccess::new(qcow2);
+
+        image.write(&[0x11u8; 512][..], 0).await.unwrap();
+        let (
+            Mapping::Raw {
+                offset: discarded_offset,
+                ..
+            },
+            _,
+        ) = image.get_mapping(0, 512).await.unwrap()
+        else {
+            panic!("Expected a data mapping");
+        };
+
+        image.discard_to_backing(0, 512).await.unwrap();
+        let (mapping, _) = image.get_mapping(0, 512).await.unwrap();
+        assert!(
+            !matches!(mapping, Mapping::Raw { .. }),
+            "Discarded cluster still mapped: {mapping:?}"
+        );
+
+        // The discarded cluster has been freed, so the next allocation can reuse it
+        image.write(&[0x22u8; 512][..], 512).await.unwrap();
+        let (Mapping::Raw { offset, .. }, _) = image.get_mapping(512, 512).await.unwrap() else {
+            panic!("Expected a data mapping");
+        };
+        assert_eq!(offset, discarded_offset);
+    }
+}
