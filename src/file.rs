@@ -1276,4 +1276,46 @@ mod tests {
 
         io::Result::Ok(())
     }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn write_zeroes_past_eof_grows_file() -> io::Result<()> {
+        let path = test_dir().join(format!(
+            "imago-write-zeroes-past-eof-{}.raw",
+            std::process::id()
+        ));
+        let _temp_path = TempPath(path.clone());
+
+        let file = File::create_open(StorageCreateOptions::new().filename(&path)).await?;
+        // To actually exercise the efficient zero-write path, use the reported zero alignment as
+        // the test granularity (at least 4096).
+        let granularity = cmp::max(file.zero_align(), 4096) as u64;
+        file.write(&vec![0xabu8; granularity as usize][..], 0)
+            .await?;
+        assert_eq!(fs::metadata(&path)?.len(), granularity);
+        assert_eq!(file.size()?, granularity);
+
+        // Range starting at EOF
+        file.write_zeroes(granularity, granularity).await?;
+        assert_eq!(fs::metadata(&path)?.len(), 2 * granularity);
+        assert_eq!(file.size()?, 2 * granularity);
+
+        let mut buf = vec![0u8; 2 * granularity as usize];
+        file.read(&mut buf, 0).await?;
+        assert!(buf[..granularity as usize].iter().all(|&byte| byte == 0xab));
+        assert!(buf[granularity as usize..].iter().all(|&byte| byte == 0));
+
+        // Range crossing EOF
+        file.write(&vec![0xcdu8; granularity as usize][..], granularity)
+            .await?;
+        file.write_zeroes(granularity, 2 * granularity).await?;
+        assert_eq!(fs::metadata(&path)?.len(), 3 * granularity);
+        assert_eq!(file.size()?, 3 * granularity);
+
+        let mut buf = vec![0xffu8; 3 * granularity as usize];
+        file.read(&mut buf, 0).await?;
+        assert!(buf[..granularity as usize].iter().all(|&byte| byte == 0xab));
+        assert!(buf[granularity as usize..].iter().all(|&byte| byte == 0));
+
+        io::Result::Ok(())
+    }
 }
