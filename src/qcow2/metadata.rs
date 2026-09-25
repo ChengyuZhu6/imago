@@ -2920,3 +2920,73 @@ fn encode_binary<T: OnDiskStruct>(val: &T) -> io::Result<Vec<u8>> {
 fn decode_binary<T: OnDiskStruct>(slice: &[u8]) -> io::Result<T> {
     T::load_from(slice)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test::mem_storage::{MemStorage, MemStorageState};
+    use std::sync::{Arc, Mutex};
+
+    /// Regression test: If the metadata file has alignment requirements larger than the cluster
+    /// size, then `write_entry()` must not try to up-align the request to that, because having the
+    /// request span multiple clusters is a very bad idea then, as this might overwrite clusters
+    /// adjacent to the table.
+    /// This test is such a case:
+    /// - Alignment is 4096
+    /// - Cluster size is 512
+    /// - The L1 table spans 5 clusters (from cluster 8 == 4096B onwards), that is, 2560B
+    ///
+    /// The old `write_entry()` tried to be clever and reduce the alignment it used such that it
+    /// would not exceed the table length, i.e. 2048B in this case, but that is (a) very unhelpful
+    /// because 2048 is just less than 4096, so does not help at all, and (b) will still be wrong
+    /// for the unaligned tail of the L1 table.
+    ///
+    /// So this test verifies that writing into that tail (cluster 4 of the L1 table) will not
+    /// overwrite anything past the L1 table.
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn l1_write_entry_beyond_table_end() {
+        let uninitialized: u8 = 0xa5;
+
+        let header = Header::new(9, 4, None, None, None);
+        let state = Arc::new(MemStorageState {
+            data: Mutex::new(vec![uninitialized; 16384]),
+            ..Default::default()
+        });
+        let mem = MemStorage::new(Arc::clone(&state), true).with_align(4096);
+
+        let l1_cluster_start = 8;
+        let l1_offset = l1_cluster_start * 512;
+        let l1_entries = 320;
+        let l1_byte_size = l1_entries * size_of::<u64>();
+
+        // Index 300 is at offset 2400, i.e. well into cluster 4 (which begins at index 256)
+        let test_index = 300;
+        let test_entry = (1 << 63) | 0x10000;
+
+        let mut data = vec![L1Entry::default(); l1_entries];
+        data[test_index] = L1Entry::try_from_plain(test_entry, &header).unwrap();
+        let mut l1 = L1Table::from_data(data.into_boxed_slice(), &header);
+        l1.set_cluster(HostCluster(l1_cluster_start as u64));
+
+        l1.write_entry(&mem, test_index).await.unwrap();
+
+        // Verify the entry was written
+        let data = state.data.lock().unwrap();
+        let offset = l1_offset + test_index * size_of::<u64>();
+        let entry = u64::from_be_bytes(
+            data[offset..(offset + size_of::<u64>())]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(entry, test_entry);
+
+        // Verify nothing past the L1 table was clobbered
+        let offset_past = l1_offset + l1_byte_size;
+        let next_alignment_boundary = offset_past.next_multiple_of(4096);
+        let clobbered = data[offset_past..next_alignment_boundary]
+            .iter()
+            .filter(|b| **b != uninitialized)
+            .count();
+        assert_eq!(clobbered, 0, "bytes after the L1 table were overwritten");
+    }
+}
