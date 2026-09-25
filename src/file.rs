@@ -219,7 +219,14 @@ impl Storage for File {
                     buffer.fill(0);
                     buffer.len()
                 } else {
-                    self.file.write().unwrap().seek_read(buffer, offset)?
+                    match self.file.write().unwrap().seek_read(buffer, offset)? {
+                        0 => {
+                            // End of file (file is shorter than `self.size`)
+                            buffer.fill(0);
+                            buffer.len()
+                        }
+                        len => len,
+                    }
                 };
                 offset = offset
                     .checked_add(len as u64)
@@ -275,6 +282,10 @@ impl Storage for File {
                 #[allow(clippy::readonly_write_lock)]
                 let file = self.file.write().unwrap();
                 let len = file.seek_write(buffer, offset)?;
+                if len == 0 {
+                    // Should not happen, i.e. is an error
+                    return Err(io::ErrorKind::WriteZero.into());
+                }
                 offset = offset
                     .checked_add(len as u64)
                     .ok_or_else(|| io::Error::other("Write offset overflow"))?;
