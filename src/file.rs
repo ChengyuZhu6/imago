@@ -892,39 +892,10 @@ impl File {
         err
     }
 
-    /// Attempt to discard range by truncating the file.
-    ///
-    /// If the range reaches the end of the file, truncate and restore the original file length.
-    /// Return `true` on success.
-    ///
-    /// If the range is not at the end of the file, i.e. another method of discarding is needed,
-    /// return `false`.
-    fn try_discard_by_truncate(&self, offset: u64, length: u64) -> io::Result<bool> {
-        // Prevent modifications to the file length
-        #[allow(clippy::readonly_write_lock)]
-        let file = self.file.write().unwrap();
-
-        let size = self.size.load(Ordering::Relaxed);
-        if offset >= size {
-            // Nothing to do
-            return Ok(true);
-        }
-
-        // If `offset + length` overflows, we can just assume it ends at `size`.  (Anything past
-        // `size is irrelevant anyway.)
-        let end = offset.checked_add(length).unwrap_or(size);
-        if end < size {
-            return Ok(false);
-        }
-
-        file.set_len(offset)?;
-        file.set_len(size)?;
-        Ok(true)
-    }
-
     /// Ensure the given range reads back as zeroes, or return an error.
     async fn discard_to_zero(&self, offset: u64, length: u64) -> io::Result<()> {
-        if self.try_discard_by_truncate(offset, length)? {
+        if offset >= self.size.load(Ordering::Relaxed) {
+            // Nothing to do
             return Ok(());
         }
 
@@ -1207,6 +1178,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
     async fn tail_discard_keeps_file_length() -> io::Result<()> {
         let path =
