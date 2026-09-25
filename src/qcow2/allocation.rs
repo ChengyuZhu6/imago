@@ -10,6 +10,8 @@ use std::sync::Mutex as SyncMutex;
 use tracing::{event, warn, Level};
 
 /// List of clusters that are no longer in use, and should be freed.
+///
+/// Shared between [`Qcow2`] and its [`Allocator`].
 #[derive(Default)]
 pub(super) struct ClustersToFreeList {
     /// The list itself.
@@ -22,6 +24,11 @@ impl ClustersToFreeList {
     /// Mark `entry` as a cluster to be freed.
     pub fn push(&self, entry: ClustersToFreeEntry) {
         self.list.lock().unwrap().push(entry);
+    }
+
+    /// Check whether the list is empty.
+    pub fn is_empty(&self) -> bool {
+        self.list.lock().unwrap().is_empty()
     }
 
     /// Remove all entries from the list and return them.
@@ -65,6 +72,11 @@ pub(super) struct Allocator<S: Storage> {
 
     /// L2 and refblock caches with dependency management.
     caches: Arc<MetadataCaches<S>>,
+
+    /// Clusters that are no longer referenced by image metadata, but not yet freed.
+    ///
+    /// Shared with [`Qcow2`].
+    clusters_to_free: Arc<ClustersToFreeList>,
 }
 
 #[maybe_async]
@@ -165,31 +177,17 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         }
     }
 
-    /// Free data clusters (i.e. decrement their refcount).
+    /// Free all clusters in `self.clusters_to_free`.
     ///
-    /// Best-effort operation.  On error, the given clusters may be leaked, but no errors are ever
-    /// returned (because there is no good way to handle such errors anyway).
-    pub(super) async fn free_data_clusters(&self, cluster: HostCluster, count: ClusterCount) {
-        if !self.header.external_data_file() {
-            if let Ok(mut allocator) = self.allocator().await {
-                // Clear L2 entries before deallocating cluster
-                if let Err(err) = self.caches.rb_depends_on_l2().await {
-                    warn!("Leaking clusters; cannot set up cache dependency: {err}");
-                    return;
-                }
-
-                allocator.free_clusters(cluster, count).await;
-            }
-        }
-    }
-
-    /// Free all allocations in `self.clusters_to_free`.
-    ///
-    /// Best-effort operation, like [`Qcow2::free_data_clusters()`].
+    /// Best-effort operation, like [`Allocator::process_clusters_to_free()`].
     pub(super) async fn process_clusters_to_free(&self) {
-        for entry in self.clusters_to_free.take() {
-            self.free_data_clusters(entry.first_cluster, entry.count)
-                .await;
+        // Skip taking the allocator lock if there is nothing to do
+        if self.clusters_to_free.is_empty() {
+            return;
+        }
+
+        if let Ok(mut allocator) = self.allocator().await {
+            allocator.process_clusters_to_free().await;
         }
     }
 }
@@ -201,6 +199,7 @@ impl<S: Storage> Allocator<S> {
         image: Arc<S>,
         header: Arc<Header>,
         caches: Arc<MetadataCaches<S>>,
+        clusters_to_free: Arc<ClustersToFreeList>,
     ) -> io::Result<Self> {
         let cb = header.cluster_bits();
         let rt_offset = header.reftable_offset();
@@ -222,7 +221,31 @@ impl<S: Storage> Allocator<S> {
             first_free_cluster: HostCluster(0),
             header,
             caches,
+            clusters_to_free,
         })
+    }
+
+    /// Free all data clusters in `self.clusters_to_free` (i.e. decrement their refcount).
+    ///
+    /// Best-effort operation.  On error, the given clusters may be leaked, but no errors are ever
+    /// returned (because there is no good way to handle such errors anyway).
+    async fn process_clusters_to_free(&mut self) {
+        let clusters_to_free = self.clusters_to_free.take();
+        // The refcount structures only track allocations in the metadata file (the qcow2 file), so
+        // when freeing data clusters with an external data file, nothing is to be done
+        if clusters_to_free.is_empty() || self.header.external_data_file() {
+            return;
+        }
+
+        // Clear L2 entries before deallocating clusters
+        if let Err(err) = self.caches.rb_depends_on_l2().await {
+            warn!("Leaking clusters; cannot set up cache dependency: {err}");
+            return;
+        }
+
+        for entry in clusters_to_free {
+            self.free_clusters(entry.first_cluster, entry.count).await;
+        }
     }
 
     /// Invaidate the refcount block cache.
@@ -707,6 +730,7 @@ mod tests {
             first_free_cluster: rb_a_cluster,
             header: Arc::clone(&header),
             caches: Arc::clone(&caches),
+            clusters_to_free: Arc::new(ClustersToFreeList::default()),
         };
 
         // Trigger reftable growth just one index beyond the current bound.

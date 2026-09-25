@@ -77,8 +77,8 @@ pub struct Qcow2<S: Storage + 'static, F: WrappedFormat<S> + 'static = FormatAcc
 
     /// Allocations that have been removed from the image metadata, but not yet freed.
     ///
-    /// Must be freed via [`Qcow2::process_clusters_to_free()`].
-    clusters_to_free: ClustersToFreeList,
+    /// Shared with the allocator.  Must be freed via [`Qcow2::process_clusters_to_free()`].
+    clusters_to_free: Arc<ClustersToFreeList>,
 }
 
 #[maybe_async]
@@ -119,12 +119,14 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 
         let metadata = Arc::new(metadata);
         let caches = Arc::new(MetadataCaches::new(&metadata, &header, 128, 32));
+        let clusters_to_free = Arc::new(ClustersToFreeList::default());
 
         let allocator = if writable {
             let allocator = Allocator::new(
                 Arc::clone(&metadata),
                 Arc::clone(&header),
                 Arc::clone(&caches),
+                Arc::clone(&clusters_to_free),
             )
             .await?;
             Some(Mutex::new(allocator))
@@ -148,7 +150,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 
             caches,
             allocator,
-            clusters_to_free: Default::default(),
+            clusters_to_free,
         })
     }
 
@@ -638,6 +640,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
                 Arc::clone(&self.metadata),
                 Arc::clone(&self.header),
                 Arc::clone(&self.caches),
+                Arc::clone(&self.clusters_to_free),
             )
             .await?;
         }
