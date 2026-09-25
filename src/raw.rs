@@ -415,8 +415,171 @@ impl<S: Storage + 'static> FormatCreateBuilder<S> for RawCreateBuilder<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io_buffers::{IoVector, IoVectorMut};
     use crate::null::Null;
+    use crate::storage::drivers::CommonStorageHelper;
     use crate::FormatAccess;
+    use std::sync::atomic::AtomicBool;
+
+    /// Null storage whose resizes can be made to fail, or be held back.
+    #[derive(Debug, Default)]
+    struct ResizeTestStorage {
+        /// Storage size.
+        size: AtomicU64,
+
+        /// Whether `resize()` should fail.
+        fail_resize: AtomicBool,
+
+        /// Hold back resizing to this size until `release_resize` is notified (0: none).
+        #[cfg(feature = "async")]
+        hold_resize_to: AtomicU64,
+
+        /// Releases a held back resize.
+        #[cfg(feature = "async")]
+        release_resize: tokio::sync::Notify,
+
+        /// Storage helper.
+        common_storage_helper: CommonStorageHelper,
+    }
+
+    impl ResizeTestStorage {
+        fn new(size: u64) -> Self {
+            ResizeTestStorage {
+                size: size.into(),
+                ..Default::default()
+            }
+        }
+    }
+
+    impl Display for ResizeTestStorage {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            write!(f, "resize-test:[{}B]", self.size.load(Ordering::Relaxed))
+        }
+    }
+
+    #[maybe_async(AFIT)]
+    impl Storage for ResizeTestStorage {
+        fn size(&self) -> io::Result<u64> {
+            Ok(self.size.load(Ordering::Relaxed))
+        }
+
+        async unsafe fn pure_readv(
+            &self,
+            mut bufv: IoVectorMut<'_>,
+            _offset: u64,
+        ) -> io::Result<()> {
+            bufv.fill(0);
+            Ok(())
+        }
+
+        async unsafe fn pure_writev(&self, _bufv: IoVector<'_>, _offset: u64) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn flush(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn sync(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn get_storage_helper(&self) -> &CommonStorageHelper {
+            &self.common_storage_helper
+        }
+
+        async fn resize(
+            &self,
+            new_size: u64,
+            _prealloc_mode: storage::PreallocateMode,
+        ) -> io::Result<()> {
+            #[cfg(feature = "async")]
+            if self.hold_resize_to.load(Ordering::Relaxed) == new_size {
+                self.release_resize.notified().await;
+            }
+
+            if self.fail_resize.load(Ordering::Relaxed) {
+                return Err(io::Error::other("Resize failed"));
+            }
+
+            self.size.store(new_size, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// Return the image’s storage.
+    fn storage(image: &FormatAccess<ResizeTestStorage>) -> &ResizeTestStorage {
+        image.collect_storage_dependencies()[0]
+    }
+
+    /// A failed resize must leave the image size unchanged.
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_failed_resize() {
+        let raw = Raw::open_image(ResizeTestStorage::new(1024), true)
+            .await
+            .unwrap();
+        let mut image = FormatAccess::new(raw);
+
+        storage(&image).fail_resize.store(true, Ordering::Relaxed);
+
+        image
+            .resize_grow(2048, PreallocateMode::None)
+            .await
+            .unwrap_err();
+        assert_eq!(image.size(), 1024);
+        assert_eq!(storage(&image).size().unwrap(), 1024);
+
+        image.resize_shrink(512).await.unwrap_err();
+        assert_eq!(image.size(), 1024);
+        assert_eq!(storage(&image).size().unwrap(), 1024);
+
+        // Once resizing works again, sizes must follow
+        storage(&image).fail_resize.store(false, Ordering::Relaxed);
+
+        image
+            .resize_grow(2048, PreallocateMode::None)
+            .await
+            .unwrap();
+        assert_eq!(image.size(), 2048);
+        assert_eq!(storage(&image).size().unwrap(), 2048);
+
+        image.resize_shrink(512).await.unwrap();
+        assert_eq!(image.size(), 512);
+        assert_eq!(storage(&image).size().unwrap(), 512);
+    }
+
+    /// A grow to a smaller size must not overtake a concurrent grow to a larger size, which would
+    /// shrink the storage below the image size.
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn test_concurrent_grow() {
+        let raw = Raw::open_image(ResizeTestStorage::new(1024), true)
+            .await
+            .unwrap();
+        let image = FormatAccess::new(raw);
+
+        // Hold back the smaller grow, which starts first, so the larger one could complete first
+        storage(&image)
+            .hold_resize_to
+            .store(2048, Ordering::Relaxed);
+
+        // `join3()` polls in order: The smaller grow first, then the larger grow, then the release
+        let (small, large, ()) = futures::future::join3(
+            image.resize_grow(2048, PreallocateMode::None),
+            image.resize_grow(4096, PreallocateMode::None),
+            async { storage(&image).release_resize.notify_one() },
+        )
+        .await;
+        small.unwrap();
+        large.unwrap();
+
+        assert_eq!(image.size(), 4096);
+        assert_eq!(storage(&image).size().unwrap(), 4096);
+    }
 
     /// Requests reaching beyond the disk size must fail without touching (and thus growing) the
     /// underlying storage.
