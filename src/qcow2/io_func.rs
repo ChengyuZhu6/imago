@@ -55,7 +55,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                     host_offset,
                     length,
                 } => {
-                    self.read_compressed_cluster(slice.into_slice(), host_offset, length)
+                    self.read_compressed_cluster(slice.into_slice(), host_offset, length.get())
                         .await?;
                 }
 

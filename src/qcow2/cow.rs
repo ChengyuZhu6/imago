@@ -130,7 +130,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                     host_offset,
                     length,
                 } => {
-                    self.cow_compressed(host_offset, length, new_cluster)
+                    self.cow_compressed(host_offset, length.get(), new_cluster)
                         .await?
                 }
             }

@@ -10,7 +10,7 @@ use crate::{Storage, StorageExt};
 use maybe_async::maybe_async;
 use std::collections::HashMap;
 use std::mem::size_of;
-use std::num::TryFromIntError;
+use std::num::{NonZero, TryFromIntError};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::{cmp, io};
 use tracing::error;
@@ -1366,7 +1366,7 @@ pub(super) enum L2Mapping {
         host_offset: HostOffset,
 
         /// Upper limit on the number of bytes that comprise the compressed data.
-        length: u64,
+        length: NonZero<u64>,
     },
 }
 
@@ -1428,15 +1428,16 @@ impl L2Entry {
 
     /// If this entry is compressed, return the start host offset and upper limit on the compressed
     /// number of bytes.
-    pub fn compressed_range(&self, cluster_bits: u32) -> Option<(HostOffset, u64)> {
+    pub fn compressed_range(&self, cluster_bits: u32) -> Option<(HostOffset, NonZero<u64>)> {
         if self.is_compressed() {
             let desc = self.compressed_descriptor();
             let compressed_offset_bits = 62 - (cluster_bits - 8);
             let offset = desc & ((1 << compressed_offset_bits) - 1) & 0x00ff_ffff_ffff_ffffu64;
-            let sectors = desc >> compressed_offset_bits;
+            let sectors: u64 = desc >> compressed_offset_bits;
             // The first sector is not considered in `sectors`, so we add it and subtract the
             // number of bytes there that do not belong to this compressed cluster
-            let length = (sectors + 1) * 512 - (offset & 511);
+            // Unwrap is safe: ∀y: 0 <= y & 511 <= 511, so ∀x >= 0: (x + 1) * 512 - (y & 511) >= 1
+            let length = NonZero::new((sectors + 1) * 512 - (offset & 511)).unwrap();
 
             Some((HostOffset(offset), length))
         } else {
@@ -1457,7 +1458,7 @@ impl L2Entry {
             // Compressed clusters can cross host cluster boundaries, and thus occupy two clusters
             let first_cluster = offset.cluster(cluster_bits);
             let cluster_count = ClusterCount::from_byte_size(
-                offset + length - first_cluster.offset(cluster_bits),
+                offset + length.get() - first_cluster.offset(cluster_bits),
                 cluster_bits,
             );
             Some((first_cluster, cluster_count))
@@ -1555,6 +1556,8 @@ impl L2Entry {
                 length,
             } => {
                 let compressed_offset_bits = 62 - (cluster_bits - 8);
+                let length = length.get();
+
                 assert!(length < 1 << cluster_bits);
                 assert!(host_offset.0 < 1 << compressed_offset_bits);
 
