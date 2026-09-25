@@ -422,6 +422,16 @@ mod tests {
 
             let result = image.discard_to_backing(offset, 4096).await;
             check(&image, result, &format!("discard_to_backing() at {offset}"));
+
+            let result = image
+                .ensure_data_mapping(offset, 4096, true)
+                .await
+                .map(|_| ());
+            check(
+                &image,
+                result,
+                &format!("ensure_data_mapping() at {offset}"),
+            );
         }
 
         // Empty requests at the end are fine
@@ -430,6 +440,12 @@ mod tests {
         image.discard_to_zero(size, 0).await.unwrap();
         image.discard_to_any(size, 0).await.unwrap();
         image.discard_to_backing(size, 0).await.unwrap();
+
+        // Empty data mappings, at the end and anywhere else
+        for offset in [size, 0] {
+            let (_, _, length) = image.ensure_data_mapping(offset, 0, true).await.unwrap();
+            assert_eq!(length, 0, "ensure_data_mapping() at {offset}");
+        }
 
         assert_eq!(image.size(), size);
     }
