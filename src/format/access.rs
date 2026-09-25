@@ -984,3 +984,148 @@ impl<S: Storage> std::future::AsyncDrop for FormatAccess<S> {
     }
 }
 */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::Format;
+    use crate::null::Null;
+    use crate::raw::Raw;
+
+    /// Driver that maps everything to another layer, with a configurable `writable` flag.
+    #[derive(Debug)]
+    struct IndirectDriver {
+        /// Layer to map to.
+        layer: FormatAccess<Null>,
+
+        /// `writable` flag for all mappings.
+        writable: bool,
+    }
+
+    impl Display for IndirectDriver {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            write!(f, "indirect[{}]", self.layer.inner())
+        }
+    }
+
+    #[maybe_async(?Send)]
+    impl FormatDriverInstance for IndirectDriver {
+        type Storage = Null;
+
+        fn format(&self) -> Format {
+            Format::Raw
+        }
+
+        async unsafe fn probe(_storage: &Null) -> io::Result<bool>
+        where
+            Self: Sized,
+        {
+            Ok(false)
+        }
+
+        fn size(&self) -> u64 {
+            self.layer.size()
+        }
+
+        fn collect_storage_dependencies(&self) -> Vec<&Null> {
+            self.layer.collect_storage_dependencies()
+        }
+
+        fn writable(&self) -> bool {
+            false
+        }
+
+        // Elidable in sync, but async needs a named lifetime for the boxed future bound
+        #[allow(clippy::needless_lifetimes)]
+        async fn get_mapping<'a>(
+            &'a self,
+            offset: u64,
+            max_length: u64,
+        ) -> io::Result<(ShallowMapping<'a, Null>, u64)> {
+            let remaining = self.size().saturating_sub(offset);
+            if remaining == 0 {
+                return Ok((ShallowMapping::Eof {}, 0));
+            }
+
+            Ok((
+                ShallowMapping::Indirect {
+                    layer: &self.layer,
+                    offset,
+                    writable: self.writable,
+                },
+                cmp::min(max_length, remaining),
+            ))
+        }
+
+        // Elidable in sync, but async needs a named lifetime for the boxed future bound
+        #[allow(clippy::needless_lifetimes)]
+        async fn ensure_data_mapping<'a>(
+            &'a self,
+            _offset: u64,
+            _length: u64,
+            _overwrite: bool,
+        ) -> io::Result<(&'a Null, u64, u64)> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        async fn flush(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn sync(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn resize_grow(
+            &self,
+            _new_size: u64,
+            _prealloc_mode: PreallocateMode,
+        ) -> io::Result<()> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        async fn resize_shrink(&mut self, _new_size: u64) -> io::Result<()> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+
+    /// A mapping reached through a non-writable indirect mapping must not be writable, even if a
+    /// later indirect mapping is writable.
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_indirect_mapping_writable() {
+        let raw = Raw::open_image(Null::new(1024), true).await.unwrap();
+        let middle = FormatAccess::new(IndirectDriver {
+            layer: FormatAccess::new(raw),
+            writable: true,
+        });
+
+        // Only writable hops: writable
+        let (mapping, _) = middle.get_mapping(0, 512).await.unwrap();
+        assert!(
+            matches!(mapping, Mapping::Raw { writable: true, .. }),
+            "{mapping:?}"
+        );
+
+        let top = FormatAccess::new(IndirectDriver {
+            layer: middle,
+            writable: false,
+        });
+
+        // Non-writable hop first, then a writable one: not writable
+        let (mapping, _) = top.get_mapping(0, 512).await.unwrap();
+        assert!(
+            matches!(
+                mapping,
+                Mapping::Raw {
+                    writable: false,
+                    ..
+                }
+            ),
+            "{mapping:?}"
+        );
+    }
+}
