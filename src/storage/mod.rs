@@ -261,6 +261,26 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     #[allow(async_fn_in_trait)] // No need for Send
     async fn sync(&self) -> io::Result<()>;
 
+    /// Wait for all modifying requests issued before this call to settle.
+    ///
+    /// When this returns, all modifying requests (writes, write-zeroes, discards) issued before
+    /// this call have completed (successfully or not), including requests whose futures were
+    /// dropped before they completed. Use this before reusing an area of the storage that such
+    /// requests may still target.
+    ///
+    /// This does not flush or sync anything; use [`Storage::flush()`] and [`Storage::sync()`] for
+    /// that.
+    ///
+    /// Implementations whose modifying requests may still be performed after their futures have
+    /// been dropped (e.g. because they submit them to the kernel via io_uring, or to a thread pool)
+    /// must override the default implementation (which does nothing).
+    ///
+    /// NOTE: This method will be *required* to be implemented starting from the imago 0.3 release.
+    #[allow(async_fn_in_trait)] // No need for Send
+    async fn settle_writes(&self) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Drop internal buffers.
     ///
     /// This drops all internal buffers, but does not flush them!  All cached data is reloaded on
@@ -433,6 +453,14 @@ pub trait DynStorage: Any + Debug + Display + Send + Sync {
     #[cfg(feature = "sync")]
     fn dyn_sync(&self) -> io::Result<()>;
 
+    /// Object-safe wrapper around [`Storage::settle_writes()`].
+    #[cfg(feature = "async")]
+    fn dyn_settle_writes(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
+
+    /// Object-safe wrapper around [`Storage::settle_writes()`].
+    #[cfg(feature = "sync")]
+    fn dyn_settle_writes(&self) -> io::Result<()>;
+
     /// Object-safe wrapper around [`Storage::invalidate_cache()`].
     ///
     /// # Safety
@@ -548,6 +576,10 @@ impl<S: Storage> Storage for &S {
 
     async fn sync(&self) -> io::Result<()> {
         (*self).sync().await
+    }
+
+    async fn settle_writes(&self) -> io::Result<()> {
+        (*self).settle_writes().await
     }
 
     async unsafe fn invalidate_cache(&self) -> io::Result<()> {
@@ -683,6 +715,16 @@ impl<S: Storage + 'static> DynStorage for S {
     }
 
     #[cfg(feature = "async")]
+    fn dyn_settle_writes(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
+        Box::pin(<S as Storage>::settle_writes(self))
+    }
+
+    #[cfg(feature = "sync")]
+    fn dyn_settle_writes(&self) -> io::Result<()> {
+        <S as Storage>::settle_writes(self)
+    }
+
+    #[cfg(feature = "async")]
     unsafe fn dyn_invalidate_cache(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
         Box::pin(unsafe { <S as Storage>::invalidate_cache(self) })
     }
@@ -785,6 +827,10 @@ impl Storage for Box<dyn DynStorage> {
         self.as_ref().dyn_sync().await
     }
 
+    async fn settle_writes(&self) -> io::Result<()> {
+        self.as_ref().dyn_settle_writes().await
+    }
+
     async unsafe fn invalidate_cache(&self) -> io::Result<()> {
         unsafe { self.as_ref().dyn_invalidate_cache().await }
     }
@@ -868,6 +914,10 @@ impl Storage for Arc<dyn DynStorage> {
 
     async fn sync(&self) -> io::Result<()> {
         self.as_ref().dyn_sync().await
+    }
+
+    async fn settle_writes(&self) -> io::Result<()> {
+        self.as_ref().dyn_settle_writes().await
     }
 
     async unsafe fn invalidate_cache(&self) -> io::Result<()> {

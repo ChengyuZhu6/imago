@@ -178,6 +178,12 @@ impl Storage for MemStorage {
         Ok(())
     }
 
+    async fn settle_writes(&self) -> io::Result<()> {
+        #[cfg(feature = "async")]
+        self.state.complete_held_writes();
+        Ok(())
+    }
+
     async unsafe fn invalidate_cache(&self) -> io::Result<()> {
         Ok(())
     }
