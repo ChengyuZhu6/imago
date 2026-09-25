@@ -31,6 +31,8 @@ use std::{cmp, fs};
 #[cfg(unix)]
 use tracing::{debug, warn};
 #[cfg(windows)]
+use windows_sys::Win32;
+#[cfg(windows)]
 use windows_sys::Win32::System::Ioctl::{FILE_ZERO_DATA_INFORMATION, FSCTL_SET_ZERO_DATA};
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::DeviceIoControl;
@@ -915,8 +917,36 @@ impl File {
 
     /// For special operations, ensure the error kind is usable.
     ///
-    /// For non-UNIX systems, this is an identity map.
-    #[cfg(not(unix))]
+    /// Rust’s std maps neither `ERROR_NOT_SUPPORTED` nor `ERROR_INVALID_FUNCTION` (which is what
+    /// file systems generally return for control codes they do not support) to
+    /// [`io::ErrorKind::Unsupported`].
+    ///
+    /// Assign the appropriate error kind to such errors so the generic code can handle them.
+    #[cfg(windows)]
+    fn map_os_err(err: io::Error) -> io::Error {
+        let Some(raw) = err.raw_os_error() else {
+            return err;
+        };
+
+        let has_kind = err.kind();
+        let want_kind = match raw as u32 {
+            Win32::Foundation::ERROR_NOT_SUPPORTED | Win32::Foundation::ERROR_INVALID_FUNCTION => {
+                io::ErrorKind::Unsupported
+            }
+            _ => has_kind,
+        };
+
+        if has_kind != want_kind {
+            io::Error::new(want_kind, err)
+        } else {
+            err
+        }
+    }
+
+    /// For special operations, ensure the error kind is usable.
+    ///
+    /// For systems other than UNIX and Windows, this is an identity map.
+    #[cfg(not(any(unix, windows)))]
     fn map_os_err(err: io::Error) -> io::Error {
         err
     }
