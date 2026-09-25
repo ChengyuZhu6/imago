@@ -1197,6 +1197,13 @@ mod tests {
 
         let contents = fs::read(&path);
         let _ = fs::remove_file(&path);
+        if zero_result
+            .as_ref()
+            .is_err_and(|err| err.kind() == io::ErrorKind::Unsupported)
+        {
+            // Nothing to test (e.g. on Wine)
+            return;
+        }
         zero_result.unwrap();
         let contents = contents.unwrap();
         assert_eq!(contents[4095], 0x5a);
@@ -1298,9 +1305,15 @@ mod tests {
         file.read(&mut prefix, 0).await?;
         assert_eq!(prefix, vec![0xabu8; granularity as usize]);
 
-        let mut tail = vec![0xffu8; granularity as usize];
-        file.read(&mut tail, granularity).await?;
-        assert!(tail.iter().all(|&byte| byte == 0));
+        // If discarding is not supported (e.g. on Wine), it is a no-op
+        if !file
+            .discard_unsupported
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let mut tail = vec![0xffu8; granularity as usize];
+            file.read(&mut tail, granularity).await?;
+            assert!(tail.iter().all(|&byte| byte == 0));
+        }
 
         io::Result::Ok(())
     }
