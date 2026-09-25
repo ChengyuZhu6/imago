@@ -1102,15 +1102,16 @@ mod ioctl {
 #[cfg(test)]
 mod tests {
     use super::File;
-    use crate::{Storage, StorageExt, StorageOpenOptions};
+    use crate::{Storage, StorageCreateOptions, StorageExt, StorageOpenOptions};
+    use std::path::PathBuf;
     #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
-    use std::{fs, io};
+    use std::{cmp, env, fs, io};
 
     #[cfg(windows)]
     #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
     async fn zero_data_preserves_the_byte_at_the_exclusive_end() {
-        let path = std::env::temp_dir().join(format!(
+        let path = test_dir().join(format!(
             "imago-zero-data-boundary-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -1144,7 +1145,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
+        let path = test_dir().join(format!(
             "imago-buffered-probe-{}-{unique}",
             std::process::id()
         ));
@@ -1174,7 +1175,18 @@ mod tests {
         assert_eq!(len, 0);
     }
 
-    struct TempPath(std::path::PathBuf);
+    /// Directory for test files.
+    ///
+    /// Taken from the `TEST_DIR` environment variable, falling back to [`env::temp_dir()`].  The
+    /// latter is often a tmpfs, which does not support all operations (e.g. `fallocate()` with
+    /// `FALLOC_FL_ZERO_RANGE`), so some code paths are only tested with fallbacks there.
+    fn test_dir() -> PathBuf {
+        env::var_os("TEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(env::temp_dir)
+    }
+
+    struct TempPath(PathBuf);
 
     impl Drop for TempPath {
         fn drop(&mut self) {
@@ -1185,8 +1197,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
     async fn tail_discard_keeps_file_length() -> io::Result<()> {
-        let path =
-            std::env::temp_dir().join(format!("imago-tail-discard-{}.raw", std::process::id()));
+        let path = test_dir().join(format!("imago-tail-discard-{}.raw", std::process::id()));
         let _temp_path = TempPath(path.clone());
         std::fs::write(&path, vec![0xabu8; 8192])?;
 
@@ -1200,6 +1211,36 @@ mod tests {
 
         let mut tail = vec![0xffu8; 4096];
         file.read(&mut tail, 4096).await?;
+        assert!(tail.iter().all(|&byte| byte == 0));
+
+        io::Result::Ok(())
+    }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn write_allocated_zeroes_past_eof_updates_size() -> io::Result<()> {
+        let path = test_dir().join(format!(
+            "imago-allocated-zeroes-past-eof-{}.raw",
+            std::process::id()
+        ));
+        let _temp_path = TempPath(path.clone());
+
+        let file = File::create_open(StorageCreateOptions::new().filename(&path)).await?;
+        // To actually exercise the efficient zero-write path, use the reported zero alignment as
+        // the test granularity (at least 4096).
+        let granularity = cmp::max(file.zero_align(), 4096) as u64;
+
+        file.write(&vec![0xabu8; granularity as usize][..], 0)
+            .await?;
+        assert_eq!(fs::metadata(&path)?.len(), granularity);
+        assert_eq!(file.size()?, granularity);
+
+        file.write_allocated_zeroes(granularity, granularity)
+            .await?;
+        assert_eq!(fs::metadata(&path)?.len(), 2 * granularity);
+        assert_eq!(file.size()?, 2 * granularity);
+
+        let mut tail = vec![0xffu8; granularity as usize];
+        file.read(&mut tail, granularity).await?;
         assert!(tail.iter().all(|&byte| byte == 0));
 
         io::Result::Ok(())
