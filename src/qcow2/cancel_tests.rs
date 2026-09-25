@@ -219,36 +219,37 @@ fn read_u64(state: &MemStorageState, offset: u64) -> u64 {
     u64::from_be_bytes(data[offset..offset + 8].try_into().unwrap())
 }
 
-/// Reading a compressed cluster while a concurrent write replaces it (freeing the compressed data)
-/// must not return data from another cluster that has reused the freed host cluster.
-#[tokio::test]
-async fn test_compressed_read_vs_cow() {
-    let state = Arc::new(MemStorageState::default());
-    let image = create_image(&state, 64 * 1024).await;
+/// Create a 512-byte-cluster image where the guest cluster at `guest_offset` is a compressed
+/// cluster containing `data`. Return the image and the compressed data's host offset.
+///
+/// imago cannot write compressed clusters, so put the compressed data and the compressed L2 entry
+/// directly into the image file.
+async fn create_compressed_image(
+    state: &Arc<MemStorageState>,
+    guest_offset: u64,
+    data: &[u8; 512],
+) -> (FormatAccess<MemStorage>, u64) {
+    let image = create_image(state, 64 * 1024).await;
 
-    // The offset of the cluster where everything happens
-    let guest_offset = 512;
-
-    // Allocate a host cluster for guest cluster 1
+    // Allocate a host cluster
     image.write(&[0x11u8; 512][..], guest_offset).await.unwrap();
     let compressed_host_offset = host_offset(&image, guest_offset).await;
     image.flush().await.unwrap();
     drop(image);
 
-    // Turn guest cluster 1 into a compressed cluster: Put compressed data into its host cluster,
+    // Turn the guest cluster into a compressed cluster: Put compressed data into its host cluster,
     // and replace its L2 entry by a compressed cluster descriptor. With 512-byte clusters, the
     // descriptor has 61 offset bits, followed by the number of additional sectors (0 here).
-    let data = [0x44u8; 512];
-    let compressed = miniz_oxide::deflate::compress_to_vec(&data, 6);
+    let compressed = miniz_oxide::deflate::compress_to_vec(data, 6);
     assert!(compressed.len() <= 512);
     state.write(compressed_host_offset, &compressed);
 
-    let l1_offset = read_u64(&state, 40);
-    let l2_offset = read_u64(&state, l1_offset) & 0x00ff_ffff_ffff_fe00;
+    let l1_offset = read_u64(state, 40);
+    let l2_offset = read_u64(state, l1_offset) & 0x00ff_ffff_ffff_fe00;
     let l2_entry = (1u64 << 62) | compressed_host_offset;
     state.write(l2_offset + 8, &l2_entry.to_be_bytes());
 
-    let image = open_image(&state).await;
+    let image = open_image(state).await;
     let mut buf = [0u8; 512];
 
     // Check that it’s a compressed cluster
@@ -258,7 +259,23 @@ async fn test_compressed_read_vs_cow() {
 
     // And verify the content
     image.read(&mut buf[..], guest_offset).await.unwrap();
-    assert!(buf == data, "Compressed cluster not read back correctly");
+    assert!(buf == *data, "Compressed cluster not read back correctly");
+
+    (image, compressed_host_offset)
+}
+
+/// Reading a compressed cluster while a concurrent write replaces it (freeing the compressed data)
+/// must not return data from another cluster that has reused the freed host cluster.
+#[tokio::test]
+async fn test_compressed_read_vs_cow() {
+    // The offset of the cluster where everything happens
+    let guest_offset = 512;
+
+    let state = Arc::new(MemStorageState::default());
+    let data = [0x44u8; 512];
+    let (image, compressed_host_offset) =
+        create_compressed_image(&state, guest_offset, &data).await;
+    let mut buf = [0u8; 512];
 
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -297,4 +314,49 @@ async fn test_compressed_read_vs_cow() {
     cow_write.await.unwrap();
     image.read(&mut buf[..], guest_offset).await.unwrap();
     assert!(buf == [0x55u8; 512], "COW write not visible");
+}
+
+/// If a concurrent write replaces a compressed cluster between `get_mapping()` returning a special
+/// mapping and reading it via `readv_special()`, the read must return the new data (and not fail
+/// because the range is no longer special).
+#[tokio::test]
+async fn test_compressed_read_vs_mapping_change() {
+    let guest_offset = 512;
+
+    let state = Arc::new(MemStorageState::default());
+    let (image, _) = create_compressed_image(&state, guest_offset, &[0x44u8; 512]).await;
+
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    // Partially overwrite guest cluster 1, so the compressed data must be COW-ed; keep that write
+    // pending on a read while it holds the L2 table’s write lock (the first read it does while
+    // holding it is for allocating the new cluster, i.e. loading a refblock)
+    state.hold_reads.store(true, Ordering::Relaxed);
+    let mut cow_write = Box::pin(image.write(&[0x55u8; 256][..], guest_offset));
+    assert!(cow_write.as_mut().poll(&mut cx).is_pending());
+    assert!(!state.held_reads.lock().unwrap().is_empty());
+    state.hold_reads.store(false, Ordering::Relaxed);
+
+    // Start reading guest cluster 1: `get_mapping()` returns a special mapping, then reading it
+    // must wait for the write
+    let mut read_buf = [0u8; 512];
+    let mut read = Box::pin(image.read(&mut read_buf[..], guest_offset));
+    assert!(read.as_mut().poll(&mut cx).is_pending());
+
+    // Let the write complete, replacing the compressed mapping
+    state.release_reads.store(true, Ordering::Relaxed);
+    let Poll::Ready(result) = cow_write.as_mut().poll(&mut cx) else {
+        panic!("Write did not complete");
+    };
+    result.unwrap();
+
+    // The read must see the new mapping and data
+    read.await.unwrap();
+    assert!(
+        read_buf[..256] == [0x55u8; 256] && read_buf[256..] == [0x44u8; 256],
+        "Expected new data (0x55, then 0x44), read {:#04x}, then {:#04x}",
+        read_buf[0],
+        read_buf[256],
+    );
 }
