@@ -1799,7 +1799,7 @@ impl L2TableWriteGuard<'_> {
             if a_cluster == host_cluster && a_count == ClusterCount(1) {
                 None
             } else {
-                Some(ClustersToFreeEntry::new(a_cluster, a_count))
+                Some(ClustersToFreeEntry::data(a_cluster, a_count))
             }
         } else {
             None
@@ -1869,7 +1869,7 @@ impl L2TableWriteGuard<'_> {
 
         let leaked = if !retained {
             old.allocation(self.table.cluster_bits, self.table.external_data_file)
-                .map(|(first_cluster, count)| ClustersToFreeEntry::new(first_cluster, count))
+                .map(|(first_cluster, count)| ClustersToFreeEntry::data(first_cluster, count))
         } else {
             None
         };
@@ -1890,7 +1890,7 @@ impl L2TableWriteGuard<'_> {
         self.table.modified.store(true, Ordering::Relaxed);
 
         old.allocation(self.table.cluster_bits, self.table.external_data_file)
-            .map(|(first_cluster, count)| ClustersToFreeEntry::new(first_cluster, count))
+            .map(|(first_cluster, count)| ClustersToFreeEntry::data(first_cluster, count))
     }
 }
 

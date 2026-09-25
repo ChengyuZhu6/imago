@@ -44,14 +44,18 @@ pub(super) struct ClustersToFreeEntry {
 
     /// Number of clusters in the range.
     count: ClusterCount,
+
+    /// Whether these are metadata clusters (or data clusters).
+    metadata: bool,
 }
 
 impl ClustersToFreeEntry {
-    /// Create an entry for the given range of clusters.
-    pub fn new(first_cluster: HostCluster, count: ClusterCount) -> Self {
+    /// Create an entry for the given range of data clusters.
+    pub fn data(first_cluster: HostCluster, count: ClusterCount) -> Self {
         ClustersToFreeEntry {
             first_cluster,
             count,
+            metadata: false,
         }
     }
 }
@@ -225,25 +229,37 @@ impl<S: Storage> Allocator<S> {
         })
     }
 
-    /// Free all data clusters in `self.clusters_to_free` (i.e. decrement their refcount).
+    /// Free all clusters in `self.clusters_to_free` (i.e. decrement their refcount).
+    ///
+    /// Must not be called while allocating clusters: Freeing data clusters requires the refblock
+    /// cache to depend on the L2 cache, which is the opposite of what allocating requires.
     ///
     /// Best-effort operation.  On error, the given clusters may be leaked, but no errors are ever
     /// returned (because there is no good way to handle such errors anyway).
     async fn process_clusters_to_free(&mut self) {
-        let clusters_to_free = self.clusters_to_free.take();
+        let (metadata_clusters, data_clusters): (Vec<_>, Vec<_>) = self
+            .clusters_to_free
+            .take()
+            .into_iter()
+            .partition(|entry| entry.metadata);
+
+        for entry in metadata_clusters {
+            self.free_clusters(entry.first_cluster, entry.count).await;
+        }
+
         // The refcount structures only track allocations in the metadata file (the qcow2 file), so
         // when freeing data clusters with an external data file, nothing is to be done
-        if clusters_to_free.is_empty() || self.header.external_data_file() {
+        if data_clusters.is_empty() || self.header.external_data_file() {
             return;
         }
 
-        // Clear L2 entries before deallocating clusters
+        // Clear L2 entries before deallocating data clusters
         if let Err(err) = self.caches.rb_depends_on_l2().await {
             warn!("Leaking clusters; cannot set up cache dependency: {err}");
             return;
         }
 
-        for entry in clusters_to_free {
+        for entry in data_clusters {
             self.free_clusters(entry.first_cluster, entry.count).await;
         }
     }
