@@ -451,8 +451,6 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         mut l2_table: L2TableWriteGuard<'_>,
         leaked_allocations: &mut Vec<(HostCluster, ClusterCount)>,
     ) -> io::Result<ClusterCount> {
-        self.header.require_version(3)?;
-
         let cb = self.header.cluster_bits();
         let mut cluster = first_cluster;
         let end_cluster = first_cluster + count;
