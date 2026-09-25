@@ -558,4 +558,43 @@ mod tests {
         };
         assert_eq!(offset, discarded_offset);
     }
+
+    /// Establishing mappings beyond the disk size must fail, also when starting at offset 0.
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_mapping_beyond_disk_size() {
+        let size = 64 * 1024;
+        let qcow2 = create_image(&Arc::default(), size, 16).await;
+        let length = size + 512;
+
+        let check = |result: io::Result<_>, req| match result {
+            Ok(_) => panic!("{req} of {length} bytes at 0 beyond the disk size ({size}) succeeded"),
+            Err(err) => assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{req}: {err}"),
+        };
+
+        check(
+            qcow2
+                .ensure_data_mapping(0, length, false)
+                .await
+                .map(|_| ()),
+            "ensure_data_mapping",
+        );
+        check(
+            qcow2.ensure_zero_mapping(0, length).await.map(|_| ()),
+            "ensure_zero_mapping",
+        );
+        // Safe: Nothing is accessing the image concurrently
+        check(
+            unsafe { qcow2.discard_to_zero_unsafe(0, length) }
+                .await
+                .map(|_| ()),
+            "discard_to_zero_unsafe",
+        );
+        // Safe: Nothing is accessing the image concurrently
+        check(
+            unsafe { qcow2.discard_to_backing_unsafe(0, length) }
+                .await
+                .map(|_| ()),
+            "discard_to_backing_unsafe",
+        );
+    }
 }
