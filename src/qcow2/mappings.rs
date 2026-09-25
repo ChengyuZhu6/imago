@@ -137,22 +137,12 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         }
 
         let l2_table = l2_table.lock_write().await;
-        let mut leaked_allocations = Vec::<(HostCluster, ClusterCount)>::new();
 
         let res = self
-            .ensure_data_mapping_no_cleanup(
-                offset,
-                length,
-                skip_cow,
-                skip_cow_to_eof,
-                l2_table,
-                &mut leaked_allocations,
-            )
+            .ensure_data_mapping_no_cleanup(offset, length, skip_cow, skip_cow_to_eof, l2_table)
             .await;
 
-        for alloc in leaked_allocations {
-            self.free_data_clusters(alloc.0, alloc.1).await;
-        }
+        self.free_leaked_allocations().await;
         let (host_offset, length) = res?;
 
         Ok((self.storage(), host_offset, length))
@@ -202,21 +192,12 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
         let l2_table = self.ensure_l2(first_cluster.offset(cb)).await?;
         let l2_table = l2_table.lock_write().await;
-        let mut leaked_allocations = Vec::<(HostCluster, ClusterCount)>::new();
 
         let res = self
-            .ensure_fixed_mapping_no_cleanup(
-                first_cluster,
-                cluster_count,
-                mapping,
-                l2_table,
-                &mut leaked_allocations,
-            )
+            .ensure_fixed_mapping_no_cleanup(first_cluster, cluster_count, mapping, l2_table)
             .await;
 
-        for alloc in leaked_allocations {
-            self.free_data_clusters(alloc.0, alloc.1).await;
-        }
+        self.free_leaked_allocations().await;
 
         let count = res?;
 
@@ -355,7 +336,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     ///
     /// Does not do any clean-up: The L2 table will probably be modified, but not written to disk.
     /// Any existing allocations that have been removed from it (and are thus leaked) are entered
-    /// into `leaked_allocations`, but not freed.
+    /// into `self.leaked_allocations`, but not freed.
     ///
     /// The caller must do both, ensuring it is done both in case of success and in case of error.
     async fn ensure_data_mapping_no_cleanup(
@@ -365,7 +346,6 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         skip_cow: bool,
         skip_cow_to_eof: bool,
         mut l2_table: L2TableWriteGuard<'_>,
-        leaked_allocations: &mut Vec<(HostCluster, ClusterCount)>,
     ) -> io::Result<(u64, u64)> {
         let cb = self.header.cluster_bits();
 
@@ -383,13 +363,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
         // Without a mandatory host offset, this should never return `Ok(None)`
         let host_cluster = self
-            .cow_cluster(
-                current_guest_cluster,
-                None,
-                partial_skip_cow,
-                &mut l2_table,
-                leaked_allocations,
-            )
+            .cow_cluster(current_guest_cluster, None, partial_skip_cow, &mut l2_table)
             .await?
             .ok_or_else(|| io::Error::other("Internal allocation error"))?;
 
@@ -417,7 +391,6 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                     Some(next_host_cluster),
                     partial_skip_cow,
                     &mut l2_table,
-                    leaked_allocations,
                 )
                 .await?;
 
@@ -438,7 +411,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     ///
     /// Does not do any clean-up: The L2 table will probably be modified, but not written to disk.
     /// Any existing allocations that have been removed from it (and are thus leaked) are entered
-    /// into `leaked_allocations`, but not freed.
+    /// into `self.leaked_allocations`, but not freed.
     ///
     /// The caller must do both, ensuring it is done both in case of success and in case of error.
     ///
@@ -449,7 +422,6 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         count: ClusterCount,
         mapping: FixedMapping,
         mut l2_table: L2TableWriteGuard<'_>,
-        leaked_allocations: &mut Vec<(HostCluster, ClusterCount)>,
     ) -> io::Result<ClusterCount> {
         let cb = self.header.cluster_bits();
         let mut cluster = first_cluster;
@@ -464,7 +436,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 FixedMapping::FullDiscard => l2_table.discard_cluster(l2i),
             };
             if let Some(leaked) = leaked {
-                leaked_allocations.push(leaked);
+                self.leaked_allocations.lock().unwrap().push(leaked);
             }
 
             done += ClusterCount(1);

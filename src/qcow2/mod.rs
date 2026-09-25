@@ -74,6 +74,12 @@ pub struct Qcow2<S: Storage + 'static, F: WrappedFormat<S> + 'static = FormatAcc
     ///
     /// Is `None` for read-only images.
     allocator: Option<Mutex<Allocator<S>>>,
+
+    /// Allocations that have been removed from the image metadata, but not yet freed.
+    ///
+    /// Must be freed via [`Qcow2::free_leaked_allocations()`].  Uses a synchronous mutex because
+    /// it is never held across `.await` points.
+    leaked_allocations: std::sync::Mutex<Vec<(HostCluster, ClusterCount)>>,
 }
 
 #[maybe_async]
@@ -143,6 +149,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 
             caches,
             allocator,
+            leaked_allocations: Default::default(),
         })
     }
 

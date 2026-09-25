@@ -141,6 +141,16 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             }
         }
     }
+
+    /// Free all allocations in `self.leaked_allocations`.
+    ///
+    /// Best-effort operation, like [`Qcow2::free_data_clusters()`].
+    pub(super) async fn free_leaked_allocations(&self) {
+        let leaked_allocations = mem::take(&mut *self.leaked_allocations.lock().unwrap());
+        for alloc in leaked_allocations {
+            self.free_data_clusters(alloc.0, alloc.1).await;
+        }
+    }
 }
 
 #[maybe_async]
