@@ -404,6 +404,19 @@ impl<S: Storage + 'static> FormatAccess<S> {
         self.readv(buf.into(), offset).await
     }
 
+    /// Check whether `offset + length` is within the disk size.
+    fn check_disk_bounds(&self, offset: u64, length: u64, req: &str) -> io::Result<()> {
+        let size = self.inner.size();
+        if offset <= size && length <= size - offset {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("Cannot {req} beyond the disk size ({length} + {offset} > {size})"),
+            ))
+        }
+    }
+
     /// Write data from `bufv` to `offset`.
     ///
     /// Writes all data from `bufv` (or returns an error), i.e. will not do short writes.  Reaching
@@ -413,14 +426,7 @@ impl<S: Storage + 'static> FormatAccess<S> {
             return Err(io::Error::other("Image is read-only"));
         }
 
-        // Limit to disk size
-        let disk_size = self.inner.size();
-        if offset >= disk_size {
-            return Ok(());
-        }
-        if bufv.len() > disk_size - offset {
-            bufv = bufv.split_at(disk_size - offset).0;
-        }
+        self.check_disk_bounds(offset, bufv.len(), "write")?;
 
         #[cfg(feature = "async")]
         let mut workers = (self.write_parallelization > 1).then(FuturesUnordered::new);
@@ -616,6 +622,8 @@ impl<S: Storage + 'static> FormatAccess<S> {
     /// Will not discard anything, which keeps existing data mappings usable, albeit writing to
     /// mappings that are now zeroed may have no effect.
     ///
+    /// Reaching the end of file before the end of the range results in an error.
+    ///
     /// Check if [`FormatAccess::discard_to_zero()`] better suits your needs: It may work better on
     /// a wider range of formats (`write_zeroes()` requires support for preallocated zero clusters,
     /// which qcow2 does have, but other formats may not), and can actually free up space.
@@ -625,6 +633,7 @@ impl<S: Storage + 'static> FormatAccess<S> {
         let max_offset = offset.checked_add(length).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "Write-zeroes range overflow")
         })?;
+        self.check_disk_bounds(offset, length, "write zeroes")?;
 
         while offset < max_offset {
             let (zofs, zlen) = self
@@ -653,6 +662,8 @@ impl<S: Storage + 'static> FormatAccess<S> {
     ///
     /// Areas that cannot be discarded (because of format-inherent alignment restrictions) are
     /// still overwritten with zeroes, unless discarding is not supported altogether.
+    ///
+    /// Reaching the end of file before the end of the range results in an error.
     pub async fn discard_to_zero(&mut self, offset: u64, length: u64) -> io::Result<()> {
         // Safe: `&mut self` guarantees nobody has concurrent data mappings
         unsafe { self.discard_to_zero_unsafe(offset, length).await }
@@ -682,6 +693,7 @@ impl<S: Storage + 'static> FormatAccess<S> {
                 "Discard-to-zero range overflow",
             )
         })?;
+        self.check_disk_bounds(offset, length, "discard")?;
 
         while offset < max_offset {
             // Safe: Caller guarantees this is safe
@@ -711,6 +723,8 @@ impl<S: Storage + 'static> FormatAccess<S> {
     ///
     /// Discarding being unsupported by this format is still returned as an error
     /// ([`std::io::ErrorKind::Unsupported`])
+    ///
+    /// Reaching the end of file before the end of the range results in an error.
     pub async fn discard_to_any(&mut self, offset: u64, length: u64) -> io::Result<()> {
         unsafe { self.discard_to_any_unsafe(offset, length).await }
     }
@@ -736,6 +750,7 @@ impl<S: Storage + 'static> FormatAccess<S> {
         let max_offset = offset.checked_add(length).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "Discard-to-any range overflow")
         })?;
+        self.check_disk_bounds(offset, length, "discard")?;
 
         while offset < max_offset {
             // Safe: Caller guarantees this is safe
@@ -759,6 +774,8 @@ impl<S: Storage + 'static> FormatAccess<S> {
     /// visible, and keep the rest as-is.  This breaks existing data mappings, so needs a mutable
     /// reference to `self`, which ensures that existing data references (which have the lifetime
     /// of an immutable `self` reference) cannot be kept.
+    ///
+    /// Reaching the end of file before the end of the range results in an error.
     pub async fn discard_to_backing(&mut self, offset: u64, length: u64) -> io::Result<()> {
         // Safe: `&mut self` guarantees nobody has concurrent data mappings
         unsafe { self.discard_to_backing_unsafe(offset, length).await }
@@ -789,6 +806,7 @@ impl<S: Storage + 'static> FormatAccess<S> {
                 "Discard-to-backing range overflow",
             )
         })?;
+        self.check_disk_bounds(offset, length, "discard")?;
 
         while offset < max_offset {
             // Safe: Caller guarantees this is safe
