@@ -66,7 +66,6 @@ impl MemStorageState {
 
     /// Perform all held writes, even if their futures have been dropped.
     #[cfg(feature = "async")]
-    #[allow(dead_code)]
     pub fn complete_held_writes(&self) {
         let held = mem::take(&mut *self.held.lock().unwrap());
         for (offset, data) in held {

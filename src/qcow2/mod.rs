@@ -3,6 +3,8 @@
 mod allocation;
 mod builder;
 mod cache;
+#[cfg(all(test, feature = "async"))]
+mod cancel_tests;
 mod compressed;
 mod cow;
 mod io_func;
