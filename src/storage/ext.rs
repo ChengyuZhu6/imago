@@ -459,3 +459,42 @@ pub(crate) async fn write_efficient_zeroes<S: StorageExt>(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test::mem_storage::{MemStorage, MemStorageState};
+    use std::sync::Arc;
+
+    /// Requests whose end, or padded end, is beyond `u64::MAX` must return an error.
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn readv_writev_overflow() {
+        let state = Arc::new(MemStorageState::default());
+        let mut buf = vec![0u8; 8192];
+
+        // (`.await` must not be used inside of macros, or `maybe_async` will not remove it)
+
+        // Aligned: end overflows
+        let mem = MemStorage::new(Arc::clone(&state), false);
+        let offset = u64::MAX - 4095;
+        let result = mem.read(&mut buf[..], offset).await;
+        assert!(result.is_err());
+        let result = mem.write(&buf[..], offset).await;
+        assert!(result.is_err());
+
+        // Unaligned (request alignment 4096): end overflows
+        let mem = MemStorage::new(state, false).with_align(4096);
+        let offset = u64::MAX - 10;
+        let result = mem.read(&mut buf[..100], offset).await;
+        assert!(result.is_err());
+        let result = mem.write(&buf[..100], offset).await;
+        assert!(result.is_err());
+
+        // Unaligned: end does not overflow, but padded end does
+        let offset = u64::MAX - 100;
+        let result = mem.read(&mut buf[..50], offset).await;
+        assert!(result.is_err());
+        let result = mem.write(&buf[..50], offset).await;
+        assert!(result.is_err());
+    }
+}
