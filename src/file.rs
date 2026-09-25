@@ -1193,6 +1193,23 @@ mod tests {
         assert_eq!(contents[8192], 0x5a);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn map_os_err_unsupported() {
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED,
+        };
+
+        for code in [ERROR_NOT_SUPPORTED, ERROR_INVALID_FUNCTION] {
+            let err = File::map_os_err(io::Error::from_raw_os_error(code as i32));
+            assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        }
+
+        // Other errors must keep their kind
+        let err = File::map_os_err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
     #[cfg(unix)]
     #[test]
     fn buffered_writable_file_is_not_modified_during_construction() {
