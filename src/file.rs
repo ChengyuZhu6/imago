@@ -296,6 +296,10 @@ impl Storage for File {
         })
         .map_err(Self::map_os_err)?;
 
+        // Without `FALLOC_FL_KEEP_SIZE`, this may have grown the file
+        self.size
+            .fetch_max(offset as u64 + length as u64, Ordering::Relaxed);
+
         Ok(())
     }
 
