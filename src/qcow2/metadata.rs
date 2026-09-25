@@ -2819,19 +2819,24 @@ pub trait Table: Sized {
     ///
     /// Potentially writes more of the table, if alignment requirements ask for that.
     async fn write_entry<S: Storage>(&self, image: &S, index: usize) -> io::Result<()> {
-        // This alignment calculation code implicitly assumes that the cluster size is aligned to
-        // the storage’s request/memory alignment, but that is often fair.  If that is not the
-        // case, there is not much we can do anyway.
-        let byte_size = self.byte_size();
-        let power_of_two_up_to_byte_size = ((byte_size / 2) + 1).next_power_of_two();
-        let alignment = cmp::min(
-            power_of_two_up_to_byte_size,
-            cmp::max(
-                cmp::max(image.mem_align(), image.req_align()),
-                size_of::<u64>(),
-            ),
-        );
-        let alignment_in_entries = alignment / size_of::<u64>();
+        // If the storage alignment does not exceed the cluster size, we can prevent a generic
+        // storage-layer RMW by making an aligned write of the fully aligned portion of the table
+        // that includes the requested index.
+        // Otherwise, it would be unsafe because the tail of the table may not be a full alignment
+        // block (so we cannot access it this way), and it would also be rather useless because we
+        // do not even know if the table’s first cluster is aligned anyway. So fall back to
+        // storage-layer RMW then.
+        let alignment = image
+            .mem_align()
+            .max(image.req_align())
+            .max(size_of::<u64>());
+        let cluster_size = 1 << self.cluster_bits();
+        let alignment = if alignment <= cluster_size {
+            alignment
+        } else {
+            size_of::<u64>()
+        };
+        let entries_to_write = alignment / size_of::<u64>();
 
         let offset = self
             .get_offset()
@@ -2843,16 +2848,16 @@ pub trait Table: Sized {
             self.entries(),
             size_of::<u64>(),
             Self::MAX_ENTRIES,
-            1 << self.cluster_bits(),
+            cluster_size,
         )?;
 
         let mut buffer = IoBuffer::new(alignment, cmp::max(image.mem_align(), size_of::<u64>()))?;
 
         // Safe because we have just allocated this, and it fits the alignment
         let raw_entries = unsafe { buffer.as_mut().into_typed_slice::<u64>() };
-        let first_index = (index / alignment_in_entries) * alignment_in_entries;
+        let first_index = (index / entries_to_write) * entries_to_write;
         #[allow(clippy::needless_range_loop)]
-        for i in 0..alignment_in_entries {
+        for i in 0..entries_to_write {
             // 0 always works, that’s by design.
             raw_entries[i] = self
                 .get_ref(first_index + i)
