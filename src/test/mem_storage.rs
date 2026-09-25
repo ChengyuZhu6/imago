@@ -11,6 +11,8 @@ use std::mem;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "async")]
+use std::task::Poll;
 
 /// State shared between a [`MemStorage`] object and the test.
 #[derive(Debug, Default)]
@@ -36,6 +38,19 @@ pub struct MemStorageState {
 
     /// Offsets of writes that have failed.
     pub failed: Mutex<Vec<u64>>,
+
+    /// While set, reads do not complete until `release_reads` is set (their offsets are entered
+    /// into `held_reads`).
+    #[cfg(feature = "async")]
+    pub hold_reads: AtomicBool,
+
+    /// Offsets of reads that have been held.
+    #[cfg(feature = "async")]
+    pub held_reads: Mutex<Vec<u64>>,
+
+    /// Allows held reads to complete (reading the data present at that point).
+    #[cfg(feature = "async")]
+    pub release_reads: AtomicBool,
 }
 
 impl MemStorageState {
@@ -54,7 +69,7 @@ impl MemStorageState {
     }
 
     /// Write `buf` to `offset`, growing the storage if necessary.
-    fn write(&self, offset: u64, buf: &[u8]) {
+    pub fn write(&self, offset: u64, buf: &[u8]) {
         let start = offset as usize;
         let end = start + buf.len();
         let mut data = self.data.lock().unwrap();
@@ -136,6 +151,19 @@ impl Storage for MemStorage {
     }
 
     async unsafe fn pure_readv(&self, mut bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
+        #[cfg(feature = "async")]
+        if self.state.hold_reads.load(Ordering::Relaxed) {
+            self.state.held_reads.lock().unwrap().push(offset);
+            std::future::poll_fn(|_| {
+                if self.state.release_reads.load(Ordering::Relaxed) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+        }
+
         let data = self.state.data.lock().unwrap();
         let offset = offset as usize;
         let len = bufv.len() as usize;

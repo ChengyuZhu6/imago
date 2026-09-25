@@ -1,4 +1,5 @@
-//! Tests for requests whose futures are dropped while the storage still has them in flight.
+//! Tests for requests whose futures are dropped while the storage still has them in flight, and
+//! for requests racing each other.
 //!
 //! Dropping a future does not necessarily stop the I/O it has issued (e.g. with io_uring, the
 //! kernel will still perform it), so such requests may complete at any later point.
@@ -7,7 +8,9 @@ use super::*;
 use crate::test::mem_storage::{MemStorage, MemStorageState};
 use crate::{DenyImplicitOpenGate, Mapping};
 use futures::FutureExt;
+use std::future::Future;
 use std::sync::atomic::Ordering;
+use std::task::{Context, Poll};
 
 /// Create a 512-byte-cluster image of the given size on a [`MemStorage`] with the given state.
 async fn create_image(state: &Arc<MemStorageState>, size: u64) -> FormatAccess<MemStorage> {
@@ -195,4 +198,103 @@ async fn test_failed_cow_frees_cluster() {
     // The failed write has freed the cluster, so the next allocation can reuse it
     image.write(&[0x33u8; 512][..], 1024).await.unwrap();
     assert_eq!(host_offset(&image, 1024).await, failed_cluster);
+}
+
+/// Open the image on a [`MemStorage`] with the given state.
+async fn open_image(state: &Arc<MemStorageState>) -> FormatAccess<MemStorage> {
+    let qcow2 = Qcow2::<MemStorage>::builder(MemStorage::new(Arc::clone(state), false))
+        .backing(None)
+        .write(true)
+        .open(DenyImplicitOpenGate::default())
+        .await
+        .unwrap();
+
+    FormatAccess::new(qcow2)
+}
+
+/// Read a big-endian 64-bit value from the storage.
+fn read_u64(state: &MemStorageState, offset: u64) -> u64 {
+    let data = state.data.lock().unwrap();
+    let offset = offset as usize;
+    u64::from_be_bytes(data[offset..offset + 8].try_into().unwrap())
+}
+
+/// Reading a compressed cluster while a concurrent write replaces it (freeing the compressed data)
+/// must not return data from another cluster that has reused the freed host cluster.
+#[tokio::test]
+async fn test_compressed_read_vs_cow() {
+    let state = Arc::new(MemStorageState::default());
+    let image = create_image(&state, 64 * 1024).await;
+
+    // The offset of the cluster where everything happens
+    let guest_offset = 512;
+
+    // Allocate a host cluster for guest cluster 1
+    image.write(&[0x11u8; 512][..], guest_offset).await.unwrap();
+    let compressed_host_offset = host_offset(&image, guest_offset).await;
+    image.flush().await.unwrap();
+    drop(image);
+
+    // Turn guest cluster 1 into a compressed cluster: Put compressed data into its host cluster,
+    // and replace its L2 entry by a compressed cluster descriptor. With 512-byte clusters, the
+    // descriptor has 61 offset bits, followed by the number of additional sectors (0 here).
+    let data = [0x44u8; 512];
+    let compressed = miniz_oxide::deflate::compress_to_vec(&data, 6);
+    assert!(compressed.len() <= 512);
+    state.write(compressed_host_offset, &compressed);
+
+    let l1_offset = read_u64(&state, 40);
+    let l2_offset = read_u64(&state, l1_offset) & 0x00ff_ffff_ffff_fe00;
+    let l2_entry = (1u64 << 62) | compressed_host_offset;
+    state.write(l2_offset + 8, &l2_entry.to_be_bytes());
+
+    let image = open_image(&state).await;
+    let mut buf = [0u8; 512];
+
+    // Check that it’s a compressed cluster
+    let mapping = image.get_mapping(guest_offset, 512).await.unwrap();
+    assert!(matches!(mapping.0, Mapping::Special { .. }));
+    assert_eq!(mapping.1, 512);
+
+    // And verify the content
+    image.read(&mut buf[..], guest_offset).await.unwrap();
+    assert!(buf == data, "Compressed cluster not read back correctly");
+
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    // Start reading the compressed cluster, keeping the read of the compressed data pending
+    state.hold_reads.store(true, Ordering::Relaxed);
+    let mut read_buf = [0u8; 512];
+    let mut read = Box::pin(image.read(&mut read_buf[..], guest_offset));
+    assert!(read.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(*state.held_reads.lock().unwrap(), [compressed_host_offset]);
+    state.hold_reads.store(false, Ordering::Relaxed);
+
+    // Concurrently overwrite guest cluster 1, replacing the compressed mapping, which frees the
+    // compressed data’s host cluster
+    let mut cow_write = Box::pin(image.write(&[0x55u8; 512][..], guest_offset));
+    if cow_write.as_mut().poll(&mut cx).is_ready() {
+        // The write did not wait for the read, so the freed host cluster can now be reused
+        image.write(&[0x66u8; 512][..], 1024).await.unwrap();
+        assert_eq!(host_offset(&image, 1024).await, compressed_host_offset);
+    }
+
+    // Let the read of the compressed data complete
+    state.release_reads.store(true, Ordering::Relaxed);
+    let Poll::Ready(result) = read.as_mut().poll(&mut cx) else {
+        panic!("Read did not complete");
+    };
+    result.unwrap();
+    drop(read);
+    assert!(
+        read_buf == data,
+        "Expected {:#04x} bytes, read {:#04x} bytes",
+        data[0],
+        read_buf[0],
+    );
+
+    cow_write.await.unwrap();
+    image.read(&mut buf[..], guest_offset).await.unwrap();
+    assert!(buf == [0x55u8; 512], "COW write not visible");
 }
