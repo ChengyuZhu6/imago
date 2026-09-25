@@ -101,6 +101,10 @@ impl<S: Storage> StorageExt for S {
             return Ok(());
         }
 
+        let unpadded_end = offset
+            .checked_add(bufv.len())
+            .ok_or_else(|| io::Error::other("Read wrap-around"))?;
+
         let mem_align = self.mem_align();
         let req_align = self.req_align();
 
@@ -120,14 +124,18 @@ impl<S: Storage> StorageExt for S {
         let len_align_mask = req_align_mask | (mem_align as u64 - 1);
         debug_assert!((len_align_mask + 1).is_multiple_of(req_align as u64));
 
-        let unpadded_end = offset + bufv.len();
         let padded_offset = offset & !req_align_mask;
         // This will over-align at the end of file (aligning to exactly the end of file would be
         // sufficient), but it is easier this way.
-        let padded_end = (unpadded_end + req_align_mask) & !req_align_mask;
+        let padded_end = unpadded_end
+            .checked_add(req_align_mask)
+            .ok_or_else(|| io::Error::other("Read wrap-around"))?
+            & !req_align_mask;
         // Now also align to memory alignment
         let padded_len = (padded_end - padded_offset + len_align_mask) & !(len_align_mask);
-        let padded_end = padded_offset + padded_len;
+        let padded_end = padded_offset
+            .checked_add(padded_len)
+            .ok_or_else(|| io::Error::other("Read wrap-around"))?;
 
         let padded_len: usize = (padded_end - padded_offset)
             .try_into()
@@ -154,11 +162,15 @@ impl<S: Storage> StorageExt for S {
             return Ok(());
         }
 
+        let unpadded_end = offset
+            .checked_add(bufv.len())
+            .ok_or_else(|| io::Error::other("Write wrap-around"))?;
+
         let mem_align = self.mem_align();
         let req_align = self.req_align();
 
         if is_aligned(&bufv, offset, mem_align, req_align) {
-            let _sw_guard = self.weak_write_blocker(offset..(offset + bufv.len())).await;
+            let _sw_guard = self.weak_write_blocker(offset..unpadded_end).await;
 
             // Safe: Alignment checked, and weak write blocker set up
             return unsafe { self.pure_writev(bufv, offset) }.await;
@@ -176,16 +188,20 @@ impl<S: Storage> StorageExt for S {
         let len_align = req_align_mask + 1;
         debug_assert!(len_align.is_multiple_of(req_align));
 
-        let unpadded_end = offset + bufv.len();
         let padded_offset = offset & !(req_align_mask as u64);
         // This will over-align at the end of file (aligning to exactly the end of file would be
         // sufficient), but it is easier this way.  Small TODO, as this will indeed increase the
         // file length (which the over-alignment in `unaligned_readv()` does not).
-        let padded_end = (unpadded_end + req_align_mask as u64) & !(req_align_mask as u64);
+        let padded_end = unpadded_end
+            .checked_add(req_align_mask as u64)
+            .ok_or_else(|| io::Error::other("Write wrap-around"))?
+            & !(req_align_mask as u64);
         // Now also align to memory alignment
         let padded_len =
             (padded_end - padded_offset + len_align_mask as u64) & !(len_align_mask as u64);
-        let padded_end = padded_offset + padded_len;
+        let padded_end = padded_offset
+            .checked_add(padded_len)
+            .ok_or_else(|| io::Error::other("Write wrap-around"))?;
 
         let padded_len: usize = (padded_end - padded_offset)
             .try_into()
