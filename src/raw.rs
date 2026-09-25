@@ -384,3 +384,53 @@ impl<S: Storage + 'static> FormatCreateBuilder<S> for RawCreateBuilder<S> {
         Ok(img)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::null::Null;
+    use crate::FormatAccess;
+
+    /// Requests reaching beyond the disk size must fail without touching (and thus growing) the
+    /// underlying storage.
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_access_beyond_disk_size() {
+        let size = 1024;
+        let raw = Raw::open_image(Null::new(size), true).await.unwrap();
+        let mut image = FormatAccess::new(raw);
+
+        let check = |image: &FormatAccess<Null>, result: io::Result<()>, req: &str| {
+            let err = result.expect_err(req);
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{req}: {err}");
+            let storage_size = image.collect_storage_dependencies()[0].size().unwrap();
+            assert_eq!(storage_size, size, "{req}");
+        };
+
+        // Entirely beyond the end, and crossing the end
+        for offset in [size, size / 2] {
+            let result = image.write(&[0u8; 4096][..], offset).await;
+            check(&image, result, &format!("write() at {offset}"));
+
+            let result = image.write_zeroes(offset, 4096).await;
+            check(&image, result, &format!("write_zeroes() at {offset}"));
+
+            let result = image.discard_to_zero(offset, 4096).await;
+            check(&image, result, &format!("discard_to_zero() at {offset}"));
+
+            let result = image.discard_to_any(offset, 4096).await;
+            check(&image, result, &format!("discard_to_any() at {offset}"));
+
+            let result = image.discard_to_backing(offset, 4096).await;
+            check(&image, result, &format!("discard_to_backing() at {offset}"));
+        }
+
+        // Empty requests at the end are fine
+        image.write(&[0u8; 0][..], size).await.unwrap();
+        image.write_zeroes(size, 0).await.unwrap();
+        image.discard_to_zero(size, 0).await.unwrap();
+        image.discard_to_any(size, 0).await.unwrap();
+        image.discard_to_backing(size, 0).await.unwrap();
+
+        assert_eq!(image.size(), size);
+    }
+}
