@@ -236,9 +236,12 @@ impl Storage for File {
                 .try_into()
                 .map_err(|_| io::Error::other("Write offset overflow"))?;
 
+            // Keep holding the lock until `self.size` is updated, so that `resize()` (which takes
+            // the write lock) always sees the current size
+            let file = self.file.read().unwrap();
             let len = while_eintr(|| unsafe {
                 libc::pwritev(
-                    self.file.read().unwrap().as_raw_fd(),
+                    file.as_raw_fd(),
                     iovec.as_ptr(),
                     iovec.len() as libc::c_int,
                     pwritev_offset,
@@ -265,7 +268,11 @@ impl Storage for File {
         for buffer in bufv.into_inner() {
             let mut buffer: &[u8] = &buffer;
             while !buffer.is_empty() {
-                let len = self.file.write().unwrap().seek_write(buffer, offset)?;
+                // Keep holding the lock until `self.size` is updated, so that `resize()` always
+                // sees the current size
+                #[allow(clippy::readonly_write_lock)]
+                let file = self.file.write().unwrap();
+                let len = file.seek_write(buffer, offset)?;
                 offset = offset
                     .checked_add(len as u64)
                     .ok_or_else(|| io::Error::other("Write offset overflow"))?;
