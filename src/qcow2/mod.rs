@@ -407,8 +407,8 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             .ok_or_else(|| io::Error::other("Image is read-only"))
     }
 
-    /// Check whether `length + offset` is within the disk size.
-    fn check_disk_bounds<D: Display>(&self, length: u64, offset: u64, req: D) -> io::Result<()> {
+    /// Check whether `offset + length` is within the disk size.
+    fn check_disk_bounds<D: Display>(&self, offset: u64, length: u64, req: D) -> io::Result<()> {
         let size = self.header.size();
         let length_until_eof = size.saturating_sub(offset);
         if length_until_eof >= length {
