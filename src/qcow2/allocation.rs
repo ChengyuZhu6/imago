@@ -6,7 +6,48 @@
 use super::*;
 use crate::sync_primitives::MutexGuard;
 use std::mem;
+use std::sync::Mutex as SyncMutex;
 use tracing::{event, warn, Level};
+
+/// List of clusters that are no longer in use, and should be freed.
+#[derive(Default)]
+pub(super) struct ClustersToFreeList {
+    /// The list itself.
+    ///
+    /// Synchronous mutex because it is never to be held across `.await` points.
+    list: SyncMutex<Vec<ClustersToFreeEntry>>,
+}
+
+impl ClustersToFreeList {
+    /// Mark `entry` as a cluster to be freed.
+    pub fn push(&self, entry: ClustersToFreeEntry) {
+        self.list.lock().unwrap().push(entry);
+    }
+
+    /// Remove all entries from the list and return them.
+    pub fn take(&self) -> Vec<ClustersToFreeEntry> {
+        mem::take(&mut *self.list.lock().unwrap())
+    }
+}
+
+/// Entry in [`ClustersToFreeList`]: A range of clusters to be freed.
+pub(super) struct ClustersToFreeEntry {
+    /// First cluster in the range.
+    first_cluster: HostCluster,
+
+    /// Number of clusters in the range.
+    count: ClusterCount,
+}
+
+impl ClustersToFreeEntry {
+    /// Create an entry for the given range of clusters.
+    pub fn new(first_cluster: HostCluster, count: ClusterCount) -> Self {
+        ClustersToFreeEntry {
+            first_cluster,
+            count,
+        }
+    }
+}
 
 /// Central facility for cluster allocation.
 pub(super) struct Allocator<S: Storage> {
@@ -146,9 +187,9 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     ///
     /// Best-effort operation, like [`Qcow2::free_data_clusters()`].
     pub(super) async fn process_clusters_to_free(&self) {
-        let clusters_to_free = mem::take(&mut *self.clusters_to_free.lock().unwrap());
-        for alloc in clusters_to_free {
-            self.free_data_clusters(alloc.0, alloc.1).await;
+        for entry in self.clusters_to_free.take() {
+            self.free_data_clusters(entry.first_cluster, entry.count)
+                .await;
         }
     }
 }

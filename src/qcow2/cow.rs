@@ -137,7 +137,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
         let l2i = cluster.l2_index(self.header.cluster_bits());
         if let Some(leaked) = l2_table.map_cluster(l2i, new_cluster) {
-            self.clusters_to_free.lock().unwrap().push(leaked);
+            self.clusters_to_free.push(leaked);
         }
 
         Ok(Some(new_cluster))

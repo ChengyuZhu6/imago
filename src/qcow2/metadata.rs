@@ -1,5 +1,6 @@
 //! Functionality for working with qcow2 metadata.
 
+use super::allocation::ClustersToFreeEntry;
 use super::types::*;
 use crate::io_buffers::IoBuffer;
 use crate::macros::numerical_enum;
@@ -1771,8 +1772,7 @@ impl L2TableWriteGuard<'_> {
     /// Enter the given raw data cluster mapping into the L2 table.
     ///
     /// If the previous entry pointed to an allocated cluster, return the old allocation so its
-    /// refcount can be decreased (offset of the first cluster and number of clusters -- compressed
-    /// clusters can span across host cluster boundaries).
+    /// refcount can be decreased.
     ///
     /// If the allocation is reused, `None` is returned, so this function only returns `Some(_)` if
     /// some cluster is indeed leaked.
@@ -1781,7 +1781,7 @@ impl L2TableWriteGuard<'_> {
         &mut self,
         index: usize,
         host_cluster: HostCluster,
-    ) -> Option<(HostCluster, ClusterCount)> {
+    ) -> Option<ClustersToFreeEntry> {
         let new = L2Entry::from_mapping(
             L2Mapping::DataFile {
                 host_cluster,
@@ -1799,7 +1799,7 @@ impl L2TableWriteGuard<'_> {
             if a_cluster == host_cluster && a_count == ClusterCount(1) {
                 None
             } else {
-                allocation
+                Some(ClustersToFreeEntry::new(a_cluster, a_count))
             }
         } else {
             None
@@ -1813,14 +1813,13 @@ impl L2TableWriteGuard<'_> {
     /// Otherwise, the existing mapping is discarded.
     ///
     /// If a previous mapping is discarded, return the old allocation so its refcount can be
-    /// decreased (offset of the first cluster and number of clusters -- compressed clusters can
-    /// span across host cluster boundaries).
+    /// decreased.
     #[must_use = "Leaked allocation must be freed"]
     pub fn zero_cluster(
         &mut self,
         index: usize,
         keep_allocation: bool,
-    ) -> io::Result<Option<(HostCluster, ClusterCount)>> {
+    ) -> io::Result<Option<ClustersToFreeEntry>> {
         let cluster_copied = if keep_allocation {
             match self.table.data[index].get().into_mapping(
                 GuestCluster(0), // only used for backing, which we ignore
@@ -1870,6 +1869,7 @@ impl L2TableWriteGuard<'_> {
 
         let leaked = if !retained {
             old.allocation(self.table.cluster_bits, self.table.external_data_file)
+                .map(|(first_cluster, count)| ClustersToFreeEntry::new(first_cluster, count))
         } else {
             None
         };
@@ -1879,10 +1879,9 @@ impl L2TableWriteGuard<'_> {
     /// Remove the given mapping, leaving it empty.
     ///
     /// If a previous mapping is discarded, return the old allocation so its refcount can be
-    /// decreased (offset of the first cluster and number of clusters -- compressed clusters can
-    /// span across host cluster boundaries).
+    /// decreased.
     #[must_use = "Leaked allocation must be freed"]
-    pub fn discard_cluster(&mut self, index: usize) -> Option<(HostCluster, ClusterCount)> {
+    pub fn discard_cluster(&mut self, index: usize) -> Option<ClustersToFreeEntry> {
         let new = L2Entry(0);
 
         // Safe: We set a full valid mapping, and there is only one writer (thanks to
@@ -1891,6 +1890,7 @@ impl L2TableWriteGuard<'_> {
         self.table.modified.store(true, Ordering::Relaxed);
 
         old.allocation(self.table.cluster_bits, self.table.external_data_file)
+            .map(|(first_cluster, count)| ClustersToFreeEntry::new(first_cluster, count))
     }
 }
 

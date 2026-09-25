@@ -24,7 +24,7 @@ use crate::misc_helpers::{invalid_data, ResultErrorContext};
 use crate::raw::Raw;
 use crate::sync_primitives::{Mutex, RwLock};
 use crate::{storage, FormatAccess, ShallowMapping, Storage, StorageExt, StorageOpenOptions};
-use allocation::Allocator;
+use allocation::{Allocator, ClustersToFreeList};
 pub use builder::{Qcow2CreateBuilder, Qcow2OpenBuilder};
 use cache::MetadataCaches;
 use mappings::FixedMapping;
@@ -77,9 +77,8 @@ pub struct Qcow2<S: Storage + 'static, F: WrappedFormat<S> + 'static = FormatAcc
 
     /// Allocations that have been removed from the image metadata, but not yet freed.
     ///
-    /// Must be freed via [`Qcow2::process_clusters_to_free()`].  Uses a synchronous mutex because
-    /// it is never held across `.await` points.
-    clusters_to_free: std::sync::Mutex<Vec<(HostCluster, ClusterCount)>>,
+    /// Must be freed via [`Qcow2::process_clusters_to_free()`].
+    clusters_to_free: ClustersToFreeList,
 }
 
 #[maybe_async]
@@ -602,6 +601,11 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
     }
 
     async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        // Forget clusters that were still to be freed: Freeing them would modify the image, which
+        // must not happen here, and they are unused only per our outdated view of the image
+        // anyway.  (If they really are unused, they are leaked.)
+        self.clusters_to_free.take();
+
         // Safe: Caller says we should do this
         unsafe { self.caches.invalidate_l2() }.await?;
         if let Some(allocator) = self.allocator.as_ref() {

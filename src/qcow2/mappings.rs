@@ -436,7 +436,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 FixedMapping::FullDiscard => l2_table.discard_cluster(l2i),
             };
             if let Some(leaked) = leaked {
-                self.clusters_to_free.lock().unwrap().push(leaked);
+                self.clusters_to_free.push(leaked);
             }
 
             done += ClusterCount(1);
