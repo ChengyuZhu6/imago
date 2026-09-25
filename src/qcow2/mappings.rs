@@ -142,7 +142,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             .ensure_data_mapping_no_cleanup(offset, length, skip_cow, skip_cow_to_eof, l2_table)
             .await;
 
-        self.free_leaked_allocations().await;
+        self.process_clusters_to_free().await;
         let (host_offset, length) = res?;
 
         Ok((self.storage(), host_offset, length))
@@ -197,7 +197,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             .ensure_fixed_mapping_no_cleanup(first_cluster, cluster_count, mapping, l2_table)
             .await;
 
-        self.free_leaked_allocations().await;
+        self.process_clusters_to_free().await;
 
         let count = res?;
 
@@ -336,7 +336,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     ///
     /// Does not do any clean-up: The L2 table will probably be modified, but not written to disk.
     /// Any existing allocations that have been removed from it (and are thus leaked) are entered
-    /// into `self.leaked_allocations`, but not freed.
+    /// into `self.clusters_to_free`, but not freed.
     ///
     /// The caller must do both, ensuring it is done both in case of success and in case of error.
     async fn ensure_data_mapping_no_cleanup(
@@ -411,7 +411,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     ///
     /// Does not do any clean-up: The L2 table will probably be modified, but not written to disk.
     /// Any existing allocations that have been removed from it (and are thus leaked) are entered
-    /// into `self.leaked_allocations`, but not freed.
+    /// into `self.clusters_to_free`, but not freed.
     ///
     /// The caller must do both, ensuring it is done both in case of success and in case of error.
     ///
@@ -436,7 +436,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 FixedMapping::FullDiscard => l2_table.discard_cluster(l2i),
             };
             if let Some(leaked) = leaked {
-                self.leaked_allocations.lock().unwrap().push(leaked);
+                self.clusters_to_free.lock().unwrap().push(leaked);
             }
 
             done += ClusterCount(1);

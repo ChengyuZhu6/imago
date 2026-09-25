@@ -35,7 +35,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     /// `l2_table` is the L2 table for `offset`.
     ///
     /// If a previously existing allocation is replaced, the old one will be put into
-    /// `self.leaked_allocations`.  The caller must free it.
+    /// `self.clusters_to_free`.  The caller must free it.
     pub(super) async fn cow_cluster(
         &self,
         cluster: GuestCluster,
@@ -137,7 +137,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
         let l2i = cluster.l2_index(self.header.cluster_bits());
         if let Some(leaked) = l2_table.map_cluster(l2i, new_cluster) {
-            self.leaked_allocations.lock().unwrap().push(leaked);
+            self.clusters_to_free.lock().unwrap().push(leaked);
         }
 
         Ok(Some(new_cluster))
