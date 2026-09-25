@@ -210,14 +210,22 @@ impl<S: Storage + 'static> FormatAccess<S> {
                 Ok(())
             }
 
-            // FIXME: TOCTTOU problem.  Not sure how to fully fix it, if possible at all.
-            // (Concurrent writes can change the mapping, but the driver will have to reload the
-            // mapping because it cannot pass it in `NonRecursiveMapping::Special`.  It may then
-            // find that this is no longer a “special” range.  Even passing the low-level mapping
-            // information in `Mapping::Special` wouldn’t fully fix it, though: If concurrent
-            // writes change the low-level cluster type, and the driver then tries to e.g.
-            // decompress the data that was there, that may well fail.)
-            Mapping::Special { layer, offset } => layer.inner.readv_special(bufv, offset).await,
+            Mapping::Special { layer, offset } => {
+                // Concurrent writes may have changed the mapping since we looked it up, so the
+                // driver may find that (some tail of) this range is no longer special. It then
+                // returns that tail (unread), which we read according to its current mapping.
+                let Some((tail, tail_offset)) = layer.inner.try_readv_special(bufv, offset).await?
+                else {
+                    return Ok(());
+                };
+
+                // Recursion, so we need to `Box::pin()` in async mode (and `return` is needed
+                // because `#[cfg()]` requires full statements ending in `;`).
+                #[cfg(feature = "async")]
+                return Box::pin(layer.readv(tail, tail_offset)).await;
+                #[cfg(feature = "sync")]
+                return layer.readv(tail, tail_offset);
+            }
         }
     }
 

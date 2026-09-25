@@ -581,8 +581,20 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
     }
 
     async fn readv_special(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
-        let offset = GuestOffset(offset);
-        self.do_readv_special(bufv, offset).await
+        match self.do_readv_special(bufv, GuestOffset(offset)).await? {
+            None => Ok(()),
+            Some((_, tail_offset)) => Err(io::Error::other(format!(
+                "Range at {tail_offset:#x} is not compressed (anymore)"
+            ))),
+        }
+    }
+
+    async fn try_readv_special<'a>(
+        &self,
+        bufv: IoVectorMut<'a>,
+        offset: u64,
+    ) -> io::Result<Option<(IoVectorMut<'a>, u64)>> {
+        self.do_readv_special(bufv, GuestOffset(offset)).await
     }
 
     async fn flush(&self) -> io::Result<()> {

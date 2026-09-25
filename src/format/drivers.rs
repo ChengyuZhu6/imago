@@ -256,6 +256,29 @@ pub trait FormatDriverInstance: Any + Debug + Display + Send + Sync {
         Err(io::ErrorKind::Unsupported.into())
     }
 
+    /// Read data from a `ShallowMapping::Special` area, returning the unhandled tail.
+    ///
+    /// Like [`Self::readv_special()`], but if the area turns out not to be special (anymore) from
+    /// some point on (e.g. because a concurrent write has changed its mapping), stop there and
+    /// return that unhandled tail of `bufv` and its offset.  That tail has not been written to, so
+    /// the caller can read it according to its current (non-special) mapping.
+    ///
+    /// Return `None` if the whole area has been read.
+    ///
+    /// The default implementation calls [`Self::readv_special()`], so never returns a tail.
+    ///
+    /// NOTE: Starting from the imago 0.3 release, this function will no longer have a default
+    /// implementation building on [`Self::readv_special()`], and instead will return an error.
+    /// Then, *this* function will need to be implemented, *not* [`Self::readv_special()`].
+    async fn try_readv_special<'a>(
+        &self,
+        bufv: IoVectorMut<'a>,
+        offset: u64,
+    ) -> io::Result<Option<(IoVectorMut<'a>, u64)>> {
+        self.readv_special(bufv, offset).await?;
+        Ok(None)
+    }
+
     /// Flush internal buffers.
     ///
     /// Does not need to ensure those buffers are synced to disk (hardware), and does not need to
