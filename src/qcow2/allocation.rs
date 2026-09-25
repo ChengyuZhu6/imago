@@ -236,19 +236,39 @@ impl<S: Storage> Allocator<S> {
     /// Best-effort operation.  On error, the given clusters may be leaked, but no errors are ever
     /// returned (because there is no good way to handle such errors anyway).
     async fn process_clusters_to_free(&mut self) {
-        let (metadata_clusters, data_clusters): (Vec<_>, Vec<_>) = self
+        let (metadata_clusters, mut data_clusters): (Vec<_>, Vec<_>) = self
             .clusters_to_free
             .take()
             .into_iter()
             .partition(|entry| entry.metadata);
 
+        // The refcount structures only track allocations in the metadata file (the qcow2 file), so
+        // when freeing data clusters with an external data file, nothing is to be done
+        if self.header.external_data_file() {
+            data_clusters.clear();
+        }
+
+        if metadata_clusters.is_empty() && data_clusters.is_empty() {
+            return;
+        }
+
+        // Writes whose futures have been dropped may still be in flight to these clusters, and
+        // must not be performed after the clusters have been reused.
+        // For data clusters, that can be any cancelled guest write; for metadata clusters, it
+        // could for example be a canceled L1 or reftable entry write, after which the table is
+        // grown and the old one freed.
+        // In any case, all of these clusters will be in the qcow2 (metadata) file, because data
+        // clusters in external data files do not need this treatment.
+        if let Err(err) = self.file.settle_writes().await {
+            warn!("Leaking clusters; cannot settle writes: {err}");
+            return;
+        }
+
         for entry in metadata_clusters {
             self.free_clusters(entry.first_cluster, entry.count).await;
         }
 
-        // The refcount structures only track allocations in the metadata file (the qcow2 file), so
-        // when freeing data clusters with an external data file, nothing is to be done
-        if data_clusters.is_empty() || self.header.external_data_file() {
+        if data_clusters.is_empty() {
             return;
         }
 
