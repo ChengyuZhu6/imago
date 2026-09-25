@@ -123,3 +123,76 @@ async fn test_dropped_l1_entry_write_vs_l1_growth_and_realloc() {
         buf[0],
     );
 }
+
+/// Return the cluster-aligned host offset (assuming a cluster size of 512) of the first held
+/// write, which must exist.
+fn first_held_cluster(state: &MemStorageState) -> u64 {
+    state
+        .held
+        .lock()
+        .unwrap()
+        .first()
+        .expect("Expected a held write")
+        .0
+        & !511
+}
+
+/// If a write allocating a new data cluster is cancelled while copying data into it (COW), the
+/// cluster must be freed, not leaked.
+#[tokio::test]
+async fn test_cancelled_cow_frees_cluster() {
+    let state = Arc::new(MemStorageState::default());
+    let image = create_image(&state, 64 * 1024).await;
+
+    // Allocate guest cluster 0 (so the L2 table exists)
+    image.write(&[0x11u8; 512][..], 0).await.unwrap();
+
+    // Partially write guest cluster 1, so the rest of it must be COW-ed into the new cluster, and
+    // drop the future while that write is in flight
+    state.hold_writes.store(true, Ordering::Relaxed);
+    assert!(image
+        .write(&[0x22u8; 256][..], 512)
+        .now_or_never()
+        .is_none());
+    state.hold_writes.store(false, Ordering::Relaxed);
+    let cancelled_cluster = first_held_cluster(&state);
+
+    // Guest cluster 1 must not be mapped
+    let mapping = image.get_mapping(512, 512).await.unwrap().0;
+    assert!(
+        !matches!(mapping, Mapping::Raw { .. }),
+        "Cancelled write left a mapping: {mapping:?}"
+    );
+
+    // Flushing frees the clusters from the cancelled write (after settling its writes)
+    image.flush().await.unwrap();
+
+    // So the next allocation can reuse it
+    image.write(&[0x33u8; 512][..], 1024).await.unwrap();
+    assert_eq!(host_offset(&image, 1024).await, cancelled_cluster);
+}
+
+/// If a write allocating a new data cluster fails while copying data into it (COW), the cluster
+/// must be freed, not leaked.
+#[tokio::test]
+async fn test_failed_cow_frees_cluster() {
+    let state = Arc::new(MemStorageState::default());
+    let image = create_image(&state, 64 * 1024).await;
+
+    // Allocate guest cluster 0 (so the L2 table exists)
+    image.write(&[0x11u8; 512][..], 0).await.unwrap();
+
+    // Partially write guest cluster 1, so the rest of it must be COW-ed into the new cluster, and
+    // let that write fail
+    state.fail_next_write.store(true, Ordering::Relaxed);
+    image.write(&[0x22u8; 256][..], 512).await.unwrap_err();
+    let failed_cluster = {
+        let failed = state.failed.lock().unwrap();
+        assert_eq!(failed.len(), 1, "Expected exactly one failed write");
+        failed[0] & !511
+    };
+
+    // The failed write has freed the cluster, so the next allocation can reuse it
+    image.write(&[0x33u8; 512][..], 1024).await.unwrap();
+    assert_eq!(host_offset(&image, 1024).await, failed_cluster);
+}
