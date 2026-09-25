@@ -416,7 +416,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         } else {
             Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                format!("Cannot {req} beyond the disk size ({length} + {offset} > {size}"),
+                format!("Cannot {req} beyond the disk size ({length} + {offset} > {size})"),
             ))
         }
     }
