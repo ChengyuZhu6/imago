@@ -26,3 +26,15 @@ It currently has a default implementation on top of `readv_special()`, which
 never returns a tail (and so leads to errors in the case described above).
 Make `try_readv_special()` required, and give `readv_special()` a default
 implementation on top of `try_readv_special()`.
+
+## Deprecate the `sync-wrappers` feature
+
+`sync-wrappers` provides synchronous wrappers around the `async` interface,
+which run the `async` functions in a `tokio` runtime they build.  The `sync`
+feature provides native synchronous methods without that overhead, and the
+feature documentation already announces that `sync-wrappers` is planned to be
+deprecated.
+
+The wrappers also duplicate the `async` interface’s documentation, which has to
+be kept in sync by hand (e.g. `SyncFormatAccess` does not mention that requests
+beyond the disk size return an error, unlike `FormatAccess`).
