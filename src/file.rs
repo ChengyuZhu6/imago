@@ -1376,4 +1376,48 @@ mod tests {
 
         io::Result::Ok(())
     }
+
+    /// Reading past the actual end of file must work even if `File::size` is larger.
+    #[cfg(windows)]
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn read_past_external_truncation() -> io::Result<()> {
+        use crate::StorageOpenOptions;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let path = test_dir().join(format!(
+            "imago-read-past-external-truncation-{}.raw",
+            std::process::id()
+        ));
+        let _temp_path = TempPath(path.clone());
+        std::fs::write(&path, vec![0xabu8; 8192])?;
+
+        let file = File::open(StorageOpenOptions::new().filename(&path)).await?;
+        // Truncate behind `file`'s back, so its cached size is too large
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .set_len(4096)?;
+
+        // When broken, reading spins forever; abort instead of hanging
+        let done = Arc::new(AtomicBool::new(false));
+        let watchdog_done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(10));
+            if !watchdog_done.load(Ordering::Relaxed) {
+                eprintln!("read_past_external_truncation: Read hangs, aborting");
+                std::process::abort();
+            }
+        });
+
+        let mut buf = vec![0xffu8; 8192];
+        file.read(&mut buf[..], 0).await?;
+        done.store(true, Ordering::Relaxed);
+
+        assert!(buf[..4096].iter().all(|&byte| byte == 0xab));
+        assert!(buf[4096..].iter().all(|&byte| byte == 0));
+
+        io::Result::Ok(())
+    }
 }
