@@ -13,7 +13,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 #[cfg(feature = "async")]
-use std::task::Poll;
+use std::task::{Context, Poll, Waker};
 
 /// State shared between a [`MemStorage`] object and the test.
 #[derive(Debug, Default)]
@@ -46,6 +46,10 @@ pub struct MemStorageState {
     /// Allows delayed writes to complete.
     #[cfg(feature = "async")]
     pub release_writes: AtomicBool,
+
+    /// Wakers of held writes, woken when they are released.
+    #[cfg(feature = "async")]
+    pub held_write_wakers: Mutex<Vec<Waker>>,
 
     /// If set, the next write fails (and its offset is entered into `failed`), independently of
     /// `hold_range`.
@@ -109,12 +113,41 @@ impl MemStorageState {
             self.write(offset, &data);
         }
     }
+
+    /// Let held writes (current and future ones) complete, performing them.
+    ///
+    /// Writes already performed by [`MemStorageState::complete_held_writes()`] are not performed
+    /// again.
+    #[cfg(feature = "async")]
+    pub fn release_held_writes(&self) {
+        let wakers = {
+            let mut wakers = self.held_write_wakers.lock();
+            self.release_writes.store(true, Ordering::Relaxed);
+            mem::take(&mut *wakers)
+        };
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
+    /// Check whether held writes have been released; if not, register to be woken on release.
+    #[cfg(feature = "async")]
+    fn poll_write_release(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut wakers = self.held_write_wakers.lock();
+        if self.release_writes.load(Ordering::Relaxed) {
+            Poll::Ready(())
+        } else {
+            wakers.push(cx.waker().clone());
+            Poll::Pending
+        }
+    }
 }
 
 /// In-memory storage.
 ///
 /// Supports alignment requirements, injecting write errors, a fixed size, and (in async mode)
-/// holding back writes, which then remain in flight when their futures are dropped.
+/// holding back writes, which then remain in flight when their futures are dropped, or complete
+/// once released.
 #[derive(Debug)]
 pub struct MemStorage {
     /// State shared with the test.
@@ -222,10 +255,19 @@ impl Storage for MemStorage {
 
         #[cfg(feature = "async")]
         if self.state.should_hold(offset, bounce.len() as u64) {
-            self.state.held.lock().push((offset, bounce));
-            // We intend to be dropped, so hold indefinitely (while internally,
-            // [`MemStorageState::complete_held_writes()`] will write the data eventually)
-            return std::future::pending().await;
+            self.state.held.lock().push((offset, bounce.clone()));
+            // Hold until released; if we are dropped before, the data will still be written
+            // eventually by [`MemStorageState::complete_held_writes()`]
+            std::future::poll_fn(|cx| self.state.poll_write_release(cx)).await;
+
+            // Perform the write, unless `complete_held_writes()` already has
+            let mut held = self.state.held.lock();
+            if let Some(index) = held.iter().position(|(o, d)| *o == offset && *d == bounce) {
+                held.remove(index);
+                drop(held);
+                self.state.write(offset, &bounce);
+            }
+            return Ok(());
         }
 
         self.state.write(offset, &bounce);

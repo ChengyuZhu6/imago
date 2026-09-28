@@ -606,6 +606,171 @@ mod tests {
             .unwrap()
     }
 
+    /// Load the reftable from storage.
+    #[cfg(feature = "async")]
+    #[maybe_async]
+    async fn load_reftable(qcow2: &Qcow2<MemStorage>) -> RefTable {
+        let cb = qcow2.header.cluster_bits();
+        let rt_cluster = qcow2.header.reftable_offset().checked_cluster(cb).unwrap();
+        RefTable::load(
+            qcow2.metadata.as_ref(),
+            &qcow2.header,
+            rt_cluster,
+            qcow2.header.reftable_entries(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Two concurrent flushes writing back the same L2 table, with the table modified in between:
+    /// The modification must end up on disk, i.e. the older copy must not be written last.
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn test_concurrent_l2_writeback() {
+        use futures::task::noop_waker;
+        use std::future::Future;
+        use std::sync::atomic::Ordering;
+        use std::task::{Context, Poll};
+
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = create_image(&state, 64 * 1024, 16).await;
+        let cb = qcow2.header.cluster_bits();
+
+        // Map guest clusters 0 and 1 (all in the same L2 table), and write everything
+        qcow2.ensure_data_mapping(0, 1024, true).await.unwrap();
+        qcow2.flush().await.unwrap();
+
+        // Modify the L2 table, so the next flush will write it
+        qcow2.ensure_data_mapping(1024, 512, true).await.unwrap();
+
+        let l2_cluster = {
+            let l1 = qcow2.l1_table.read().await;
+            l1.get(GuestOffset(0).l1_index(cb))
+                .l2_offset()
+                .unwrap()
+                .checked_cluster(cb)
+                .unwrap()
+        };
+        let l2_offset = l2_cluster.offset(cb).0;
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // Flush A: Keep it pending on writing the L2 table, after it has copied its entries
+        *state.hold_range.lock() = Some(l2_offset..l2_offset + 512);
+        state.hold_writes.store(true, Ordering::Relaxed);
+        let mut flush_a = Box::pin(qcow2.flush());
+        assert!(flush_a.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(state.held.lock().len(), 1);
+        state.hold_writes.store(false, Ordering::Relaxed);
+
+        // Modify the L2 table again: Make guest cluster 1 a zero cluster
+        qcow2.ensure_zero_mapping(512, 512).await.unwrap();
+
+        // Flush B: Must write the L2 table after flush A
+        let mut flush_b = Box::pin(qcow2.flush());
+        let flush_b_result = match flush_b.as_mut().poll(&mut cx) {
+            Poll::Ready(result) => Some(result),
+            Poll::Pending => None,
+        };
+
+        state.release_held_writes();
+        let Poll::Ready(result) = flush_a.as_mut().poll(&mut cx) else {
+            panic!("Flush A did not complete");
+        };
+        result.unwrap();
+        match flush_b_result {
+            Some(result) => result.unwrap(),
+            None => flush_b.await.unwrap(),
+        }
+
+        // Guest cluster 1’s L2 entry must have the zero flag (bit 0) on disk
+        let entry_offset = (l2_offset + 8) as usize;
+        let data = state.data.lock();
+        let entry = u64::from_be_bytes(data[entry_offset..entry_offset + 8].try_into().unwrap());
+        assert!(
+            entry & 1 != 0,
+            "zeroing guest cluster 1 lost on disk (L2 entry {entry:#x})"
+        );
+    }
+
+    /// Two concurrent flushes writing back the same refblock, with a refcount changed in between:
+    /// The change must end up on disk, i.e. the older copy must not be written last.
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn test_concurrent_refblock_writeback() {
+        use futures::task::noop_waker;
+        use std::future::Future;
+        use std::sync::atomic::Ordering;
+        use std::task::{Context, Poll};
+
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = create_image(&state, 64 * 1024, 16).await;
+        let rb_bits = qcow2.header.rb_bits();
+        let refcount_bytes = 2; // 16-bit refcounts
+        qcow2.flush().await.unwrap();
+
+        // Modify the refblock, so the next flush will write it
+        let first_pending = qcow2.allocate_meta_cluster().await.unwrap();
+        let first = first_pending.cluster();
+        first_pending.make_persistent();
+        assert_eq!(first.rt_index(rb_bits), 0);
+        let rb_offset = load_reftable(&qcow2)
+            .await
+            .get(0)
+            .refblock_offset()
+            .unwrap()
+            .0;
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // Flush A: Keep it pending on writing the refblock, after it has copied its data
+        *state.hold_range.lock() = Some(rb_offset..rb_offset + 512);
+        state.hold_writes.store(true, Ordering::Relaxed);
+        let mut flush_a = Box::pin(qcow2.flush());
+        assert!(flush_a.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(state.held.lock().len(), 1);
+        state.hold_writes.store(false, Ordering::Relaxed);
+
+        // Modify the refblock again
+        let second_pending = qcow2.allocate_meta_cluster().await.unwrap();
+        let second = second_pending.cluster();
+        second_pending.make_persistent();
+        assert_eq!(second.rt_index(rb_bits), 0);
+
+        // Flush B: Must write the refblock after flush A
+        let mut flush_b = Box::pin(qcow2.flush());
+        let flush_b_result = match flush_b.as_mut().poll(&mut cx) {
+            Poll::Ready(result) => Some(result),
+            Poll::Pending => None,
+        };
+
+        state.release_held_writes();
+        let Poll::Ready(result) = flush_a.as_mut().poll(&mut cx) else {
+            panic!("Flush A did not complete");
+        };
+        result.unwrap();
+        match flush_b_result {
+            Some(result) => result.unwrap(),
+            None => flush_b.await.unwrap(),
+        }
+
+        // The second cluster’s refcount must be 1 on disk
+        let refcount_offset =
+            (rb_offset + (second.rb_index(rb_bits) * refcount_bytes) as u64) as usize;
+        let data = state.data.lock();
+        let refcount = u16::from_be_bytes(
+            data[refcount_offset..refcount_offset + refcount_bytes]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(
+            refcount, 1,
+            "refcount increment for {second:?} lost on disk"
+        );
+    }
+
     /// Fully discarding (to the backing file) must work on qcow2 v2 images, too, because it only
     /// requires setting L2 entries to 0.
     #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
