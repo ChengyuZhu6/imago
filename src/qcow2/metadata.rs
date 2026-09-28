@@ -1756,6 +1756,9 @@ pub(super) struct L2Table {
     /// to disk must work without the lock because otherwise flushing the table would deadlock
     /// against such writes.
     writer_lock: OwnedRwLock<()>,
+
+    /// Serializes writing this table back to disk (see [`L2Table::write_if_modified()`]).
+    writeback_lock: Mutex<()>,
 }
 
 /// Write guard for an L2 table.
@@ -1784,6 +1787,7 @@ impl L2Table {
             external_data_file: header.external_data_file(),
             modified: true.into(),
             writer_lock: Default::default(),
+            writeback_lock: Default::default(),
         }
     }
 
@@ -1817,6 +1821,33 @@ impl L2Table {
     ) -> io::Result<Option<CompressedClusterReadGuard<'_>>> {
         let lock = self.writer_lock.read().await;
         CompressedClusterReadGuard::new(self, cluster, lock.into())
+    }
+
+    /// Write this table to disk if it has been modified since it was last written.
+    ///
+    /// This is the entry point for writing back a table that is part of the L2 cache; it
+    /// serializes such write-backs against each other via `writeback_lock`.  Writing the table
+    /// clears the modified flag before copying the entries, so without that lock, two concurrent
+    /// write-backs could race such that the one with the older copy writes last, leaving that
+    /// older copy on disk while the table no longer appears modified.  Holding the lock across the
+    /// modified check means that a write-back which has to wait only writes again if something
+    /// changed after the preceding write-back’s copy.
+    ///
+    /// `cluster` is the cluster this table is expected to belong to; an `assert!()` verifies that
+    /// it really is the table’s cluster.
+    pub async fn write_if_modified<S: Storage>(
+        &self,
+        image: &S,
+        cluster: HostCluster,
+    ) -> io::Result<()> {
+        let _lock = self.writeback_lock.lock().await;
+
+        if !self.is_modified() {
+            return Ok(());
+        }
+
+        assert!(self.get_cluster().unwrap() == cluster);
+        self.write(image).await
     }
 }
 
@@ -1991,6 +2022,7 @@ impl Table for L2Table {
             external_data_file: header.external_data_file(),
             modified: true.into(),
             writer_lock: Default::default(),
+            writeback_lock: Default::default(),
         }
     }
 
@@ -2061,6 +2093,7 @@ impl Clone for L2Table {
             external_data_file: self.external_data_file,
             modified,
             writer_lock: Default::default(),
+            writeback_lock: Default::default(),
         }
     }
 }
@@ -2307,6 +2340,9 @@ pub(super) struct RefBlock {
 
     /// Lock for creating `RefBlockWriteGuard`.
     writer_lock: Mutex<()>,
+
+    /// Serializes writing this block back to disk (see [`RefBlock::write_if_modified()`]).
+    writeback_lock: Mutex<()>,
 }
 
 /// Write guard for a refblock.
@@ -2332,6 +2368,7 @@ impl RefBlock {
             cluster_bits: header.cluster_bits(),
             modified: true.into(),
             writer_lock: Default::default(),
+            writeback_lock: Default::default(),
         })
     }
 
@@ -2366,6 +2403,7 @@ impl RefBlock {
             cluster_bits,
             modified: false.into(),
             writer_lock: Default::default(),
+            writeback_lock: Default::default(),
         })
     }
 
@@ -2539,6 +2577,33 @@ impl RefBlock {
             rb: self,
             _lock: self.writer_lock.lock().await,
         }
+    }
+
+    /// Write this block to disk if it has been modified since it was last written.
+    ///
+    /// This is the entry point for writing back a block that is part of the refblock cache; it
+    /// serializes such write-backs against each other via `writeback_lock`.  Writing the block
+    /// clears the modified flag before copying the data, so without that lock, two concurrent
+    /// write-backs could race such that the one with the older copy writes last, leaving that
+    /// older copy on disk while the block no longer appears modified.  Holding the lock across the
+    /// modified check means that a write-back which has to wait only writes again if something
+    /// changed after the preceding write-back’s copy.
+    ///
+    /// `cluster` is the cluster this block is expected to belong to; an `assert!()` verifies that
+    /// it really is the block’s cluster.
+    pub async fn write_if_modified<S: Storage>(
+        &self,
+        image: &S,
+        cluster: HostCluster,
+    ) -> io::Result<()> {
+        let _lock = self.writeback_lock.lock().await;
+
+        if !self.is_modified() {
+            return Ok(());
+        }
+
+        assert!(self.get_cluster().unwrap() == cluster);
+        self.write(image).await
     }
 
     /// Check whether this block has been modified since it was last written.

@@ -50,11 +50,9 @@ impl<S: Storage> AsyncLruCacheBackend for L2CacheBackend<S> {
 
     async fn flush(&self, l2_cluster: HostCluster, l2_table: &L2Table) -> io::Result<()> {
         trace!("Flushing L2 table");
-        if l2_table.is_modified() {
-            assert!(l2_table.get_cluster().unwrap() == l2_cluster);
-            l2_table.write(self.file.as_ref()).await?;
-        }
-        Ok(())
+        l2_table
+            .write_if_modified(self.file.as_ref(), l2_cluster)
+            .await
     }
 
     unsafe fn evict(&self, _l2_cluster: HostCluster, l2_table: L2Table) {
@@ -85,11 +83,9 @@ impl<S: Storage> AsyncLruCacheBackend for RefBlockCacheBackend<S> {
     }
 
     async fn flush(&self, rb_cluster: HostCluster, refblock: &RefBlock) -> io::Result<()> {
-        if refblock.is_modified() {
-            assert!(refblock.get_cluster().unwrap() == rb_cluster);
-            refblock.write(self.file.as_ref()).await?;
-        }
-        Ok(())
+        refblock
+            .write_if_modified(self.file.as_ref(), rb_cluster)
+            .await
     }
 
     unsafe fn evict(&self, _rb_cluster: HostCluster, refblock: RefBlock) {
@@ -124,12 +120,17 @@ enum CacheDependency {
 /// freeing).
 ///
 /// Announcing a dependency takes the `direction` lock and flushes the other cache while holding
-/// it, so `direction` is the innermost lock: Never acquire the lock of a metadata table (such as
-/// [`L2Table`]’s write lock) while holding that direction lock.
+/// it, so `direction` is the innermost lock: Never acquire a metadata table’s `writer_lock` (the
+/// lock guarding modifications to its entries, e.g. on [`L2Table`]) while holding that direction
+/// lock.
 ///
 /// Conversely, note that for an allocating write, an L2 table is held write-locked across its data
-/// I/O while its prepared data mapping is uncommitted.  Therefore, writing a table back to disk
-/// must never take that table lock, because doing so would deadlock against the still-held lock.
+/// I/O while its prepared data mapping is uncommitted, and allocating the clusters announces its
+/// dependency (taking the `direction` lock) while that write lock is held.  Therefore, writing a
+/// table back to disk must never take the table’s `writer_lock`, because doing so would deadlock
+/// against the still-held lock.  It does take the table’s separate `writeback_lock` (see
+/// [`L2Table::write_if_modified()`]); that is a leaf, held only across the write itself and never
+/// across anything that acquires `direction`.
 pub(super) struct MetadataCaches<S: Storage> {
     /// L2 table cache
     l2: AsyncLruCache<HostCluster, L2Table, L2CacheBackend<S>>,
