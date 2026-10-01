@@ -56,7 +56,6 @@ impl ClustersToFreeList {
 /// it can reference them, dropping this guard enters them into [`ClustersToFreeList`], so they are
 /// not leaked.  Once they are referenced (at least in memory), disarm the guard.
 #[must_use = "Dropping the guard frees the clusters"]
-#[allow(dead_code)]
 pub(super) struct PendingClusters {
     /// List to enter the clusters into.
     clusters_to_free: Arc<ClustersToFreeList>,
@@ -65,7 +64,6 @@ pub(super) struct PendingClusters {
     entry: Option<ClustersToFreeEntry>,
 }
 
-#[allow(dead_code)]
 impl PendingClusters {
     /// First cluster of the allocation.
     pub fn cluster(&self) -> HostCluster {
@@ -517,7 +515,7 @@ impl<S: Storage> Allocator<S> {
         }
         new_rb.write(self.file.as_ref()).await?;
 
-        self.reftable.enter_refblock(rt_index, &new_rb)?;
+        self.reftable.enter_refblock(rt_index, &new_rb, None)?;
         self.reftable
             .write_entry(self.file.as_ref(), rt_index)
             .await?;
@@ -610,7 +608,7 @@ impl<S: Storage> Allocator<S> {
 
             let mut rb = RefBlock::new_cleared(self.file.as_ref(), &self.header)?;
             rb.set_cluster(index);
-            new_rt.enter_refblock(rt_i, &rb)?;
+            new_rt.enter_refblock(rt_i, &rb, None)?;
             let rb = Arc::new(rb);
             self.caches.rb_insert(index, Arc::clone(&rb)).await?;
             refblocks.push(rb);

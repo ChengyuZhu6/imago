@@ -1,6 +1,6 @@
 //! Functionality for working with qcow2 metadata.
 
-use super::allocation::ClustersToFreeEntry;
+use super::allocation::{ClustersToFreeEntry, PendingClusters};
 use super::types::*;
 use crate::io_buffers::IoBuffer;
 use crate::macros::numerical_enum;
@@ -834,7 +834,18 @@ impl Header {
     }
 
     /// Enter a new L1 table in the image header.
-    pub fn set_l1_table(&self, l1_table: &L1Table) -> io::Result<()> {
+    ///
+    /// If the L1 table’s clusters have been newly allocated, `new_allocation` must be their
+    /// pending clusters guard, which is disarmed once the table is entered.
+    pub fn set_l1_table(
+        &self,
+        l1_table: &L1Table,
+        new_allocation: Option<PendingClusters>,
+    ) -> io::Result<()> {
+        if let Some(new_allocation) = new_allocation.as_ref() {
+            debug_assert_eq!(Some(new_allocation.cluster()), l1_table.get_cluster());
+        }
+
         let offset = l1_table.get_offset().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -848,8 +859,10 @@ impl Header {
             .map_err(|err| invalid_data(format!("Too many L1 entries ({entries}): {err}")))?;
 
         self.v2.l1_table_offset.store(offset.0, Ordering::Relaxed);
-
         self.v2.l1_size.store(entries, Ordering::Relaxed);
+        if let Some(new_allocation) = new_allocation {
+            new_allocation.make_persistent();
+        }
 
         Ok(())
     }
@@ -1212,7 +1225,19 @@ impl L1Table {
     }
 
     /// Enter the given L2 table into this L1 table.
-    pub fn enter_l2_table(&mut self, index: usize, l2: &L2Table) -> io::Result<()> {
+    ///
+    /// If the L2 table’s cluster has been newly allocated, `new_allocation` must be its pending
+    /// clusters guard, which is disarmed once the table is entered.
+    pub fn enter_l2_table(
+        &mut self,
+        index: usize,
+        l2: &L2Table,
+        new_allocation: Option<PendingClusters>,
+    ) -> io::Result<()> {
+        if let Some(new_allocation) = new_allocation.as_ref() {
+            debug_assert_eq!(Some(new_allocation.cluster()), l2.get_cluster());
+        }
+
         let l2_offset = l2.get_offset().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1224,6 +1249,9 @@ impl L1Table {
         debug_assert!(l1entry.reserved_bits() == 0);
         self.data[index] = l1entry;
         self.modified.store(true, Ordering::Relaxed);
+        if let Some(new_allocation) = new_allocation {
+            new_allocation.make_persistent();
+        }
 
         Ok(())
     }
@@ -1776,12 +1804,20 @@ impl L2TableWriteGuard<'_> {
     ///
     /// If the allocation is reused, `None` is returned, so this function only returns `Some(_)` if
     /// some cluster is indeed leaked.
+    ///
+    /// If `host_cluster` has been newly allocated, `new_allocation` must be its pending clusters
+    /// guard, which is disarmed once the mapping is in place.
     #[must_use = "Leaked allocation must be freed"]
     pub fn map_cluster(
         &mut self,
         index: usize,
         host_cluster: HostCluster,
+        new_allocation: Option<PendingClusters>,
     ) -> Option<ClustersToFreeEntry> {
+        if let Some(new_allocation) = new_allocation.as_ref() {
+            debug_assert_eq!(new_allocation.cluster(), host_cluster);
+        }
+
         let new = L2Entry::from_mapping(
             L2Mapping::DataFile {
                 host_cluster,
@@ -1793,6 +1829,9 @@ impl L2TableWriteGuard<'_> {
         // `L2TableWriteGuard`).
         let l2e = unsafe { self.table.data[index].swap(new) };
         self.table.modified.store(true, Ordering::Relaxed);
+        if let Some(new_allocation) = new_allocation {
+            new_allocation.make_persistent();
+        }
 
         let allocation = l2e.allocation(self.table.cluster_bits, self.table.external_data_file);
         if let Some((a_cluster, a_count)) = allocation {
@@ -2107,7 +2146,19 @@ impl RefTable {
     }
 
     /// Enter the given refcount block into this refcount table.
-    pub fn enter_refblock(&mut self, index: usize, rb: &RefBlock) -> io::Result<()> {
+    ///
+    /// If the refblock’s cluster has been newly allocated, `new_allocation` must be its pending
+    /// clusters guard, which is disarmed once the refblock is entered.
+    pub fn enter_refblock(
+        &mut self,
+        index: usize,
+        rb: &RefBlock,
+        new_allocation: Option<PendingClusters>,
+    ) -> io::Result<()> {
+        if let Some(new_allocation) = new_allocation.as_ref() {
+            debug_assert_eq!(Some(new_allocation.cluster()), rb.get_cluster());
+        }
+
         let rb_offset = rb.get_offset().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2119,6 +2170,9 @@ impl RefTable {
         debug_assert!(rt_entry.reserved_bits() == 0);
         self.data[index] = rt_entry;
         self.modified.store(true, Ordering::Relaxed);
+        if let Some(new_allocation) = new_allocation {
+            new_allocation.make_persistent();
+        }
 
         Ok(())
     }

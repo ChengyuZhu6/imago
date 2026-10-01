@@ -283,7 +283,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         l2_table.set_cluster(l2_cluster);
         l2_table.write(self.metadata.as_ref()).await?;
 
-        l1_locked.enter_l2_table(l1_index, &l2_table)?;
+        l1_locked.enter_l2_table(l1_index, &l2_table, None)?;
         l1_locked
             .write_entry(self.metadata.as_ref(), l1_index)
             .await?;
@@ -319,7 +319,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         new_l1.set_cluster(l1_start);
         new_l1.write(self.metadata.as_ref()).await?;
 
-        self.header.set_l1_table(&new_l1)?;
+        self.header.set_l1_table(&new_l1, None)?;
         self.header
             .write_l1_table_pointer(self.metadata.as_ref())
             .await?;
