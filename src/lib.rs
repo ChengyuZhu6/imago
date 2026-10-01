@@ -127,6 +127,8 @@ pub mod qcow2;
 pub mod raw;
 pub mod storage;
 mod sync_primitives;
+#[cfg(test)]
+mod test;
 pub mod vmdk;
 
 pub use format::access::{FormatAccess, Mapping};
