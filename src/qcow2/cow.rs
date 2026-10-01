@@ -66,27 +66,31 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
         self.need_writable()?;
 
-        let new_cluster = if let L2Mapping::Zero {
+        // New cluster index, and, if newly allocated, a `PendingClusters` guard
+        let new_cluster: Option<(HostCluster, Option<PendingClusters>)> = if let L2Mapping::Zero {
             host_cluster: Some(host_cluster),
             copied: true,
         } = existing_mapping
         {
             if let Some(mandatory_host_cluster) = mandatory_host_cluster {
                 if host_cluster == mandatory_host_cluster {
-                    Some(host_cluster)
+                    Some((host_cluster, None))
                 } else {
                     // Discard existing mapping
                     self.allocate_data_cluster_at(cluster, Some(mandatory_host_cluster))
                         .await?
+                        .map(|allocation| (allocation.cluster(), Some(allocation)))
                 }
             } else {
-                Some(host_cluster)
+                Some((host_cluster, None))
             }
         } else {
             self.allocate_data_cluster_at(cluster, mandatory_host_cluster)
                 .await?
+                .map(|allocation| (allocation.cluster(), Some(allocation)))
         };
-        let Some(new_cluster) = new_cluster else {
+
+        let Some((new_cluster, new_allocation)) = new_cluster else {
             // Allocation at `mandatory_host_cluster` failed
             return Ok(None);
         };
@@ -136,7 +140,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         }
 
         let l2i = cluster.l2_index(self.header.cluster_bits());
-        if let Some(leaked) = l2_table.map_cluster(l2i, new_cluster, None) {
+        if let Some(leaked) = l2_table.map_cluster(l2i, new_cluster, new_allocation) {
             self.clusters_to_free.push(leaked);
         }
 

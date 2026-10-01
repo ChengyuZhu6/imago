@@ -26,7 +26,7 @@ use crate::misc_helpers::{invalid_data, ResultErrorContext};
 use crate::raw::Raw;
 use crate::sync_primitives::{Mutex, RwLock};
 use crate::{storage, FormatAccess, ShallowMapping, Storage, StorageExt, StorageOpenOptions};
-use allocation::{Allocator, ClustersToFreeEntry, ClustersToFreeList};
+use allocation::{Allocator, ClustersToFreeEntry, ClustersToFreeList, PendingClusters};
 pub use builder::{Qcow2CreateBuilder, Qcow2OpenBuilder};
 use cache::MetadataCaches;
 use mappings::FixedMapping;

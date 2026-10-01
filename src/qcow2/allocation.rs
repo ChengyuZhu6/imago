@@ -41,7 +41,6 @@ impl ClustersToFreeList {
     /// This is for use in allocation paths, where a cluster is allocated, not yet hooked up, and
     /// anything might cause the hooking-up not to happen, in which case `entry` should be dropped.
     /// Once it is hooked up, the guard will be disarmed, thus making the cluster permanent.
-    #[allow(dead_code)]
     pub fn pending_guard(self: &Arc<Self>, entry: ClustersToFreeEntry) -> PendingClusters {
         PendingClusters {
             clusters_to_free: Arc::clone(self),
@@ -158,18 +157,27 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     /// Allocate one metadata cluster.
     ///
     /// Metadata clusters are allocated exclusively in the metadata (image) file.
-    pub(super) async fn allocate_meta_cluster(&self) -> io::Result<HostCluster> {
+    ///
+    /// The returned guard frees the cluster when dropped, unless it is disarmed by referencing the
+    /// cluster.
+    pub(super) async fn allocate_meta_cluster(&self) -> io::Result<PendingClusters> {
         self.allocate_meta_clusters(ClusterCount(1)).await
     }
 
     /// Allocate multiple continuous metadata clusters.
     ///
     /// Useful e.g. for the L1 table or refcount table.
+    ///
+    /// The returned guard frees the clusters when dropped, unless it is disarmed by referencing
+    /// the clusters.
     pub(super) async fn allocate_meta_clusters(
         &self,
         count: ClusterCount,
-    ) -> io::Result<HostCluster> {
-        self.allocator().await?.allocate_clusters(count, None).await
+    ) -> io::Result<PendingClusters> {
+        self.allocator()
+            .await?
+            .allocate_clusters(count, None, true)
+            .await
     }
 
     /// Allocate one data clusters for the given guest cluster.
@@ -180,19 +188,27 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     /// With an external data file, data clusters aren’t really allocated, but just put there at
     /// the same offset as their guest offset.  Their refcount is not tracked by the qcow2 metadata
     /// structures (which only cover the metadata (image) file).
+    ///
+    /// The returned guard frees the cluster when dropped, unless it is disarmed by referencing the
+    /// cluster.  (With an external data file, freeing is a no-op.)
     pub(super) async fn allocate_data_cluster(
         &self,
         guest_cluster: GuestCluster,
-    ) -> io::Result<HostCluster> {
+    ) -> io::Result<PendingClusters> {
         if self.header.external_data_file() {
-            Ok(HostCluster(guest_cluster.0))
+            let cluster = HostCluster(guest_cluster.0);
+            Ok(self
+                .clusters_to_free
+                .pending_guard(ClustersToFreeEntry::data(cluster, ClusterCount(1))))
         } else {
             let mut allocator = self.allocator().await?;
 
             // Allocate clusters before setting up L2 entries
             self.caches.l2_depends_on_rb().await?;
 
-            allocator.allocate_clusters(ClusterCount(1), None).await
+            allocator
+                .allocate_clusters(ClusterCount(1), None, false)
+                .await
         }
     }
 
@@ -207,26 +223,31 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         &self,
         guest_cluster: GuestCluster,
         mandatory_host_cluster: Option<HostCluster>,
-    ) -> io::Result<Option<HostCluster>> {
+    ) -> io::Result<Option<PendingClusters>> {
         let Some(mandatory_host_cluster) = mandatory_host_cluster else {
             return self.allocate_data_cluster(guest_cluster).await.map(Some);
         };
 
-        if self.header.external_data_file() {
-            let cluster = HostCluster(guest_cluster.0);
-            Ok((cluster == mandatory_host_cluster).then_some(cluster))
+        let allocated = if self.header.external_data_file() {
+            HostCluster(guest_cluster.0) == mandatory_host_cluster
         } else {
             let mut allocator = self.allocator().await?;
 
             // Allocate clusters before setting up L2 entries
             self.caches.l2_depends_on_rb().await?;
 
-            let cluster = allocator
+            allocator
                 .allocate_cluster_at(mandatory_host_cluster)
                 .await?
-                .then_some(mandatory_host_cluster);
-            Ok(cluster)
-        }
+        };
+
+        Ok(allocated.then(|| {
+            self.clusters_to_free
+                .pending_guard(ClustersToFreeEntry::data(
+                    mandatory_host_cluster,
+                    ClusterCount(1),
+                ))
+        }))
     }
 
     /// Free all clusters in `self.clusters_to_free`.
@@ -346,11 +367,17 @@ impl<S: Storage> Allocator<S> {
     /// `end_cluster` should only be used when allocating refblocks.  When reaching this cluster
     /// index, abort trying to allocate.  (This is used for allocating refblocks, to prevent
     /// infinite recursion and speed things up.)
+    ///
+    /// `metadata` specifies whether the clusters are to be used for metadata (true) or data
+    /// (false), in order to create the right kind of [`ClustersToFreeEntry`] for the returned
+    /// [`PendingClusters`] guard.  That returned guard frees the cluster when dropped, unless it
+    /// is disarmed by referencing the cluster.
     async fn allocate_clusters(
         &mut self,
         count: ClusterCount,
         end_cluster: Option<HostCluster>,
-    ) -> io::Result<HostCluster> {
+        metadata: bool,
+    ) -> io::Result<PendingClusters> {
         let mut index = self.first_free_cluster;
         loop {
             if end_cluster == Some(index) {
@@ -359,7 +386,12 @@ impl<S: Storage> Allocator<S> {
 
             let alloc_count = self.allocate_clusters_at(index, count).await?;
             if alloc_count == count {
-                return Ok(index);
+                let to_free_entry = if metadata {
+                    ClustersToFreeEntry::metadata(index, count)
+                } else {
+                    ClustersToFreeEntry::data(index, count)
+                };
+                return Ok(self.clusters_to_free.pending_guard(to_free_entry));
             }
 
             index += alloc_count + ClusterCount(1);
@@ -497,7 +529,7 @@ impl<S: Storage> Allocator<S> {
         // in this exact function again, trying to allocate the very same refblock (it is possible
         // we allocate one before the current one, though), and so prevent any possible infinite
         // recursion.
-        let alloc_fut_or_result = self.allocate_clusters(ClusterCount(1), Some(rb_cluster));
+        let alloc_fut_or_result = self.allocate_clusters(ClusterCount(1), Some(rb_cluster), true);
 
         // Recursion is possible, though, so in async mode, any future must be boxed
         #[cfg(feature = "async")]
@@ -506,16 +538,20 @@ impl<S: Storage> Allocator<S> {
         #[cfg(feature = "sync")]
         let alloc_result = alloc_fut_or_result;
 
-        if let Ok(new_rb_cluster) = alloc_result {
-            new_rb.set_cluster(new_rb_cluster);
+        let new_rb_allocation = if let Ok(new_rb_allocation) = alloc_result {
+            new_rb.set_cluster(new_rb_allocation.cluster());
+            Some(new_rb_allocation)
         } else {
-            // Place the refblock such that it covers itself
+            // Place the refblock such that it covers itself.  Its refcount is stored only in
+            // itself, so until it is referenced, there is nothing that could be leaked.
             new_rb.set_cluster(rb_cluster);
             new_rb.lock_write().await.increment(0)?;
-        }
+            None
+        };
         new_rb.write(self.file.as_ref()).await?;
 
-        self.reftable.enter_refblock(rt_index, &new_rb, None)?;
+        self.reftable
+            .enter_refblock(rt_index, &new_rb, new_rb_allocation)?;
         self.reftable
             .write_entry(self.file.as_ref(), rt_index)
             .await?;

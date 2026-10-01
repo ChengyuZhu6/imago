@@ -279,11 +279,11 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             L2Table::new_cleared(&self.header)
         };
 
-        let l2_cluster = self.allocate_meta_cluster().await?;
-        l2_table.set_cluster(l2_cluster);
+        let l2_allocation = self.allocate_meta_cluster().await?;
+        l2_table.set_cluster(l2_allocation.cluster());
         l2_table.write(self.metadata.as_ref()).await?;
 
-        l1_locked.enter_l2_table(l1_index, &l2_table, None)?;
+        l1_locked.enter_l2_table(l1_index, &l2_table, Some(l2_allocation))?;
         l1_locked
             .write_entry(self.metadata.as_ref(), l1_index)
             .await?;
@@ -312,12 +312,12 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     ) -> io::Result<RwLockWriteGuard<'a, L1Table>> {
         let mut new_l1 = l1_locked.clone_and_grow(at_least_index, &self.header)?;
 
-        let l1_start = self.allocate_meta_clusters(new_l1.cluster_count()).await?;
+        let l1_allocation = self.allocate_meta_clusters(new_l1.cluster_count()).await?;
 
-        new_l1.set_cluster(l1_start);
+        new_l1.set_cluster(l1_allocation.cluster());
         new_l1.write(self.metadata.as_ref()).await?;
 
-        self.header.set_l1_table(&new_l1, None)?;
+        self.header.set_l1_table(&new_l1, Some(l1_allocation))?;
         self.header
             .write_l1_table_pointer(self.metadata.as_ref())
             .await?;
