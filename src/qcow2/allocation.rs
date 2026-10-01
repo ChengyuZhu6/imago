@@ -521,9 +521,7 @@ impl<S: Storage> Allocator<S> {
             .await?;
 
         let new_rb = Arc::new(new_rb);
-        self.caches
-            .rb_insert(new_rb.get_cluster().unwrap(), Arc::clone(&new_rb))
-            .await?;
+        self.caches.rb_insert(Arc::clone(&new_rb)).await?;
         Ok(new_rb)
     }
 
@@ -610,7 +608,7 @@ impl<S: Storage> Allocator<S> {
             rb.set_cluster(index);
             new_rt.enter_refblock(rt_i, &rb, None)?;
             let rb = Arc::new(rb);
-            self.caches.rb_insert(index, Arc::clone(&rb)).await?;
+            self.caches.rb_insert(Arc::clone(&rb)).await?;
             refblocks.push(rb);
             index += ClusterCount(1);
             count -= ClusterCount(1);
@@ -774,10 +772,7 @@ mod tests {
             }
         }
         let rb_a = Arc::new(rb_a);
-        caches
-            .rb_insert(rb_a_cluster, Arc::clone(&rb_a))
-            .await
-            .unwrap();
+        caches.rb_insert(Arc::clone(&rb_a)).await.unwrap();
 
         // rt_index 4094 intentionally has no refblock at all: it is a genuinely unmapped, fully
         // free range.
@@ -794,10 +789,7 @@ mod tests {
             g.increment(1).unwrap();
         }
         let rb_b = Arc::new(rb_b);
-        caches
-            .rb_insert(rb_b_cluster, Arc::clone(&rb_b))
-            .await
-            .unwrap();
+        caches.rb_insert(Arc::clone(&rb_b)).await.unwrap();
 
         // Build the (old) reftable: entries up to (and including) rt_index_b, with only
         // rt_index_a and rt_index_b actually mapped to a refblock.

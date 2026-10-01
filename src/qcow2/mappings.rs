@@ -298,9 +298,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         }
 
         let l2_table = Arc::new(l2_table);
-        self.caches
-            .l2_insert(l2_cluster, Arc::clone(&l2_table))
-            .await?;
+        self.caches.l2_insert(Arc::clone(&l2_table)).await?;
         Ok(l2_table)
     }
 
