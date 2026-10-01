@@ -35,6 +35,57 @@ impl ClustersToFreeList {
     pub fn take(&self) -> Vec<ClustersToFreeEntry> {
         mem::take(&mut *self.list.lock().unwrap())
     }
+
+    /// Create a guard that enters `entry` into the list when dropped, unless disarmed.
+    ///
+    /// This is for use in allocation paths, where a cluster is allocated, not yet hooked up, and
+    /// anything might cause the hooking-up not to happen, in which case `entry` should be dropped.
+    /// Once it is hooked up, the guard will be disarmed, thus making the cluster permanent.
+    #[allow(dead_code)]
+    pub fn pending_guard(self: &Arc<Self>, entry: ClustersToFreeEntry) -> PendingClusters {
+        PendingClusters {
+            clusters_to_free: Arc::clone(self),
+            entry: Some(entry),
+        }
+    }
+}
+
+/// Guard for newly allocated clusters that are not yet referenced by any metadata.
+///
+/// If the operation that allocated them fails or is cancelled (i.e. its future is dropped) before
+/// it can reference them, dropping this guard enters them into [`ClustersToFreeList`], so they are
+/// not leaked.  Once they are referenced (at least in memory), disarm the guard.
+#[must_use = "Dropping the guard frees the clusters"]
+#[allow(dead_code)]
+pub(super) struct PendingClusters {
+    /// List to enter the clusters into.
+    clusters_to_free: Arc<ClustersToFreeList>,
+
+    /// The clusters; `None` when disarmed.
+    entry: Option<ClustersToFreeEntry>,
+}
+
+#[allow(dead_code)]
+impl PendingClusters {
+    /// First cluster of the allocation.
+    pub fn cluster(&self) -> HostCluster {
+        // Only `None` after `make_persistent()`, which consumes `self`
+        self.entry.as_ref().unwrap().first_cluster
+    }
+
+    /// Disarm the guard, moving the clusters from a pending state (to be freed when something goes
+    /// wrong) to a permanent state, because they are referenced now.
+    pub fn make_persistent(mut self) {
+        self.entry.take();
+    }
+}
+
+impl Drop for PendingClusters {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            self.clusters_to_free.push(entry);
+        }
+    }
 }
 
 /// Entry in [`ClustersToFreeList`]: A range of clusters to be freed.
