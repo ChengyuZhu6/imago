@@ -1102,7 +1102,7 @@ mod ioctl {
 #[cfg(test)]
 mod tests {
     use super::File;
-    use crate::{Storage, StorageCreateOptions, StorageExt, StorageOpenOptions};
+    use crate::{Storage, StorageCreateOptions, StorageExt};
     use std::path::PathBuf;
     #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1199,18 +1199,24 @@ mod tests {
     async fn tail_discard_keeps_file_length() -> io::Result<()> {
         let path = test_dir().join(format!("imago-tail-discard-{}.raw", std::process::id()));
         let _temp_path = TempPath(path.clone());
-        std::fs::write(&path, vec![0xabu8; 8192])?;
 
-        let file = File::open(StorageOpenOptions::new().write(true).filename(&path)).await?;
-        file.discard(4096, 4096).await?;
-        assert_eq!(std::fs::metadata(&path)?.len(), 8192);
+        let file = File::create_open(StorageCreateOptions::new().filename(&path)).await?;
+        // To actually exercise the discard path, use the reported discard alignment as the test
+        // granularity (at least 4096).
+        let granularity = cmp::max(file.discard_align(), 4096) as u64;
+        file.write(&vec![0xabu8; 2 * granularity as usize][..], 0)
+            .await?;
+        assert_eq!(std::fs::metadata(&path)?.len(), 2 * granularity);
 
-        let mut prefix = vec![0u8; 4096];
+        file.discard(granularity, granularity).await?;
+        assert_eq!(std::fs::metadata(&path)?.len(), 2 * granularity);
+
+        let mut prefix = vec![0u8; granularity as usize];
         file.read(&mut prefix, 0).await?;
-        assert_eq!(prefix, vec![0xabu8; 4096]);
+        assert_eq!(prefix, vec![0xabu8; granularity as usize]);
 
-        let mut tail = vec![0xffu8; 4096];
-        file.read(&mut tail, 4096).await?;
+        let mut tail = vec![0xffu8; granularity as usize];
+        file.read(&mut tail, granularity).await?;
         assert!(tail.iter().all(|&byte| byte == 0));
 
         io::Result::Ok(())
