@@ -50,16 +50,17 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             };
 
             let guest_cluster = offset.cluster(cb);
-            match l2_table.get_mapping(guest_cluster)? {
-                L2Mapping::Compressed {
-                    host_offset,
-                    length,
-                } => {
-                    self.read_compressed_cluster(slice.into_slice(), host_offset, length.get())
-                        .await?;
-                }
-
-                _ => return Err(io::ErrorKind::Other.into()),
+            {
+                // Concurrent writes may replace the compressed mapping and free the compressed
+                // data, which may then be overwritten by something else; the guard prevents
+                // modifications until we are done reading
+                let compressed_guard = l2_table
+                    .lock_compressed_read(guest_cluster)
+                    .await?
+                    .ok_or(io::ErrorKind::Other)?;
+                compressed_guard
+                    .read_compressed(self.storage(), slice.into_slice())
+                    .await?;
             }
 
             if let Some((bounce_buffer, mut chunk)) = bounce_buffer_and_chunk {

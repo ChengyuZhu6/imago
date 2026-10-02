@@ -1,12 +1,13 @@
 //! Functionality for working with qcow2 metadata.
 
 use super::allocation::{ClustersToFreeEntry, PendingClusters};
+use super::compressed::CompressedClusterReadGuard;
 use super::types::*;
 use crate::io_buffers::IoBuffer;
 use crate::macros::numerical_enum;
 use crate::macros::on_disk_struct::{on_disk_struct, OnDiskStruct};
 use crate::misc_helpers::invalid_data;
-use crate::sync_primitives::{Mutex, MutexGuard};
+use crate::sync_primitives::{Mutex, MutexGuard, RwLock, RwLockWriteGuard};
 use crate::{Storage, StorageExt};
 use maybe_async::maybe_async;
 use std::collections::HashMap;
@@ -1743,8 +1744,8 @@ pub(super) struct L2Table {
     /// Whether this table has been modified since it was last written.
     modified: AtomicBool,
 
-    /// Lock for creating `L2TableWriteGuard`.
-    writer_lock: Mutex<()>,
+    /// Lock for creating `L2TableWriteGuard` (write) and `CompressedClusterReadGuard` (read).
+    writer_lock: RwLock<()>,
 }
 
 /// Write guard for an L2 table.
@@ -1753,8 +1754,8 @@ pub(super) struct L2TableWriteGuard<'a> {
     /// Referenced L2 table.
     table: &'a L2Table,
 
-    /// Held guard mutex on that L2 table.
-    _lock: MutexGuard<'a, ()>,
+    /// Held write guard on that L2 table.
+    lock: RwLockWriteGuard<'a, ()>,
 }
 
 #[maybe_async]
@@ -1782,12 +1783,26 @@ impl L2Table {
 
     /// Allow modifying this L2 table.
     ///
-    /// Note that readers are allowed to exist while modifications are happening.
+    /// Note that readers are allowed to exist while modifications are happening, unless they hold
+    /// a [`CompressedClusterReadGuard`].
     pub async fn lock_write(&self) -> L2TableWriteGuard<'_> {
         L2TableWriteGuard {
             table: self,
-            _lock: self.writer_lock.lock().await,
+            lock: self.writer_lock.write().await,
         }
+    }
+
+    /// Lock the given compressed cluster for reading.
+    ///
+    /// Prevent modifications of this L2 table while the returned guard is held.
+    ///
+    /// Return `None` if `cluster` is not compressed (checked under the guard).
+    pub async fn lock_compressed_read(
+        &self,
+        cluster: GuestCluster,
+    ) -> io::Result<Option<CompressedClusterReadGuard<'_>>> {
+        let lock = self.writer_lock.read().await;
+        CompressedClusterReadGuard::new(self, cluster, lock.into())
     }
 }
 
@@ -1795,6 +1810,19 @@ impl L2TableWriteGuard<'_> {
     /// Look up a cluster mapping.
     pub fn get_mapping(&self, lookup_cluster: GuestCluster) -> io::Result<L2Mapping> {
         self.table.get_mapping(lookup_cluster)
+    }
+
+    /// Get a read guard for the given compressed cluster.
+    ///
+    /// The returned guard borrows this write guard, so the table cannot be modified while it is
+    /// held.
+    ///
+    /// Return `None` if `cluster` is not compressed (checked under the guard).
+    pub fn compressed_read_guard(
+        &self,
+        cluster: GuestCluster,
+    ) -> io::Result<Option<CompressedClusterReadGuard<'_>>> {
+        CompressedClusterReadGuard::new(self.table, cluster, (&self.lock).into())
     }
 
     /// Enter the given raw data cluster mapping into the L2 table.

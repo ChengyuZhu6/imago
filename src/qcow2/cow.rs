@@ -130,12 +130,9 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 } => self.cow_zero(new_cluster, partial_skip_cow).await?,
 
                 L2Mapping::Compressed {
-                    host_offset,
-                    length,
-                } => {
-                    self.cow_compressed(host_offset, length.get(), new_cluster)
-                        .await?
-                }
+                    host_offset: _,
+                    length: _,
+                } => self.cow_compressed(l2_table, cluster, new_cluster).await?,
             }
         }
 
@@ -274,22 +271,25 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
     /// Decompress a cluster into the target cluster.
     ///
-    /// Used for COW on compressed clusters.
+    /// Used for COW on compressed clusters.  `cluster` must be compressed in `l2_table`.
     async fn cow_compressed(
         &self,
-        compressed_offset: HostOffset,
-        compressed_length: u64,
+        l2_table: &L2TableWriteGuard<'_>,
+        cluster: GuestCluster,
         to_cluster: HostCluster,
     ) -> io::Result<()> {
         let to = self.storage();
 
+        let Some(compressed_guard) = l2_table.compressed_read_guard(cluster)? else {
+            // We hold the write guard, so the mapping cannot have changed since the caller looked
+            // it up
+            unreachable!();
+        };
+
         let mut buf = IoBuffer::new(self.header.cluster_size(), to.mem_align())?;
-        self.read_compressed_cluster(
-            buf.as_mut().into_slice(),
-            compressed_offset,
-            compressed_length,
-        )
-        .await?;
+        compressed_guard
+            .read_compressed(to, buf.as_mut().into_slice())
+            .await?;
 
         let to_offset = to_cluster.offset(self.header.cluster_bits());
         to.write(&buf, to_offset.0).await?;
