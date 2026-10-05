@@ -41,7 +41,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         cluster: GuestCluster,
         mandatory_host_cluster: Option<HostCluster>,
         partial_skip_cow: Option<Range<usize>>,
-        l2_table: &mut L2TableWriteGuard<'_>,
+        l2_table: &mut L2TableWriteGuard,
     ) -> io::Result<Option<HostCluster>> {
         // No need to do COW when writing the full cluster
         let full_skip_cow = if let Some(skip) = partial_skip_cow.as_ref() {
@@ -274,7 +274,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     /// Used for COW on compressed clusters.  `cluster` must be compressed in `l2_table`.
     async fn cow_compressed(
         &self,
-        l2_table: &L2TableWriteGuard<'_>,
+        l2_table: &L2TableWriteGuard,
         cluster: GuestCluster,
         to_cluster: HostCluster,
     ) -> io::Result<()> {

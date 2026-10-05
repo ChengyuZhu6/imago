@@ -348,7 +348,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         full_length: u64,
         skip_cow: bool,
         skip_cow_to_eof: bool,
-        mut l2_table: L2TableWriteGuard<'_>,
+        mut l2_table: L2TableWriteGuard,
     ) -> io::Result<(u64, u64)> {
         let cb = self.header.cluster_bits();
 
@@ -424,7 +424,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         first_cluster: GuestCluster,
         count: ClusterCount,
         mapping: FixedMapping,
-        mut l2_table: L2TableWriteGuard<'_>,
+        mut l2_table: L2TableWriteGuard,
     ) -> io::Result<ClusterCount> {
         let cb = self.header.cluster_bits();
         let mut cluster = first_cluster;

@@ -7,13 +7,14 @@ use crate::io_buffers::IoBuffer;
 use crate::macros::numerical_enum;
 use crate::macros::on_disk_struct::{on_disk_struct, OnDiskStruct};
 use crate::misc_helpers::invalid_data;
-use crate::sync_primitives::{Mutex, MutexGuard, RwLock, RwLockWriteGuard};
+use crate::sync_primitives::{Mutex, MutexGuard, OwnedRwLock, OwnedRwLockWriteGuard};
 use crate::{Storage, StorageExt};
 use maybe_async::maybe_async;
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::num::{NonZero, TryFromIntError};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::Arc;
 use std::{cmp, io};
 use tracing::error;
 
@@ -1745,17 +1746,28 @@ pub(super) struct L2Table {
     modified: AtomicBool,
 
     /// Lock for creating `L2TableWriteGuard` (write) and `CompressedClusterReadGuard` (read).
-    writer_lock: RwLock<()>,
+    ///
+    /// This is an owning (`Arc`-backed) lock, i.e. any access guard will have a strong reference
+    /// to it and can thus be held independently of lifetime concerns, e.g. across a data write
+    /// while a prepared mapping is not yet committed (see `Qcow2::prepare_data_mapping()`).
+    ///
+    /// Consequently, it may be held outside of qcow2 code paths, e.g. while a data write is in
+    /// flight (between preparing and committing a data mapping for it).  Thus, writing this table
+    /// to disk must work without the lock because otherwise flushing the table would deadlock
+    /// against such writes.
+    writer_lock: OwnedRwLock<()>,
 }
 
 /// Write guard for an L2 table.
+///
+/// Owns a reference to the table, so holding it also keeps the table pinned in the L2 cache.
 #[derive(Debug)]
-pub(super) struct L2TableWriteGuard<'a> {
+pub(super) struct L2TableWriteGuard {
     /// Referenced L2 table.
-    table: &'a L2Table,
+    table: Arc<L2Table>,
 
     /// Held write guard on that L2 table.
-    lock: RwLockWriteGuard<'a, ()>,
+    lock: OwnedRwLockWriteGuard<()>,
 }
 
 #[maybe_async]
@@ -1785,9 +1797,11 @@ impl L2Table {
     ///
     /// Note that readers are allowed to exist while modifications are happening, unless they hold
     /// a [`CompressedClusterReadGuard`].
-    pub async fn lock_write(&self) -> L2TableWriteGuard<'_> {
+    ///
+    /// The returned guard keeps the table pinned in the L2 cache.
+    pub async fn lock_write(self: &Arc<Self>) -> L2TableWriteGuard {
         L2TableWriteGuard {
-            table: self,
+            table: Arc::clone(self),
             lock: self.writer_lock.write().await,
         }
     }
@@ -1806,7 +1820,7 @@ impl L2Table {
     }
 }
 
-impl L2TableWriteGuard<'_> {
+impl L2TableWriteGuard {
     /// Look up a cluster mapping.
     pub fn get_mapping(&self, lookup_cluster: GuestCluster) -> io::Result<L2Mapping> {
         self.table.get_mapping(lookup_cluster)
@@ -1822,7 +1836,7 @@ impl L2TableWriteGuard<'_> {
         &self,
         cluster: GuestCluster,
     ) -> io::Result<Option<CompressedClusterReadGuard<'_>>> {
-        CompressedClusterReadGuard::new(self.table, cluster, (&self.lock).into())
+        CompressedClusterReadGuard::new(&self.table, cluster, (&self.lock).into())
     }
 
     /// Enter the given raw data cluster mapping into the L2 table.
