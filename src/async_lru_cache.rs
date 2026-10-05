@@ -465,7 +465,7 @@ mod tests {
     /// Backend that records flush calls in order
     #[derive(Default)]
     struct RecordingBackend {
-        flushed: std::sync::Mutex<Vec<(usize, usize)>>,
+        flushed: parking_lot::Mutex<Vec<(usize, usize)>>,
     }
 
     #[maybe_async(AFIT)]
@@ -478,7 +478,7 @@ mod tests {
         }
 
         async fn flush(&self, key: usize, value: &usize) -> io::Result<()> {
-            self.flushed.lock().unwrap().push((key, *value));
+            self.flushed.lock().push((key, *value));
             Ok(())
         }
 
@@ -568,7 +568,7 @@ mod tests {
         assert_eq!(entry, None);
         cache.get_or_insert(ENTRIES, true).await.unwrap().unwrap();
 
-        assert_eq!(*backend.flushed.lock().unwrap(), [(1, 1)]);
+        assert_eq!(*backend.flushed.lock(), [(1, 1)]);
     }
 
     /// Entries with external `Arc` references must not be evicted
@@ -585,7 +585,7 @@ mod tests {
         assert_eq!(entry, None);
         cache.get_or_insert(2, true).await.unwrap().unwrap();
 
-        assert_eq!(*backend.flushed.lock().unwrap(), [(1, 1)]);
+        assert_eq!(*backend.flushed.lock(), [(1, 1)]);
         assert_eq!(*held, 0);
     }
 
@@ -691,7 +691,7 @@ mod tests {
         let inserted = cache.insert(5, Arc::new(55), true).await.unwrap();
         assert!(inserted);
 
-        assert_eq!(*backend.flushed.lock().unwrap(), [(5, 5)]);
+        assert_eq!(*backend.flushed.lock(), [(5, 5)]);
         let entry = *cache.get_or_insert(5, false).await.unwrap().unwrap();
         assert_eq!(entry, 55);
         let entry = *cache.get_or_insert(5, true).await.unwrap().unwrap();

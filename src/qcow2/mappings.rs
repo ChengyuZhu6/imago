@@ -520,7 +520,7 @@ mod tests {
         let qcow2 = create_image(&state, 64 * 1024, 16).await;
         qcow2.flush().await.unwrap();
         drop(qcow2);
-        state.data.lock().unwrap()[4..8].copy_from_slice(&2u32.to_be_bytes());
+        state.data.lock()[4..8].copy_from_slice(&2u32.to_be_bytes());
 
         let qcow2 = Qcow2::<MemStorage>::builder(MemStorage::new(state, false))
             .backing(None)

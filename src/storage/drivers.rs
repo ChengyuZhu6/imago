@@ -29,11 +29,11 @@ use tokio::sync::oneshot::{self, Sender};
 pub struct CommonStorageHelper {
     /// Current in-flight write that allow concurrent writes to the same region.
     ///
-    /// Normal non-async RwLock, so do not await while locked!
-    weak_write_blockers: std::sync::RwLock<RangeBlockedList>,
+    /// Plain (parking_lot) RwLock, not an async one, so do not await while locked!
+    weak_write_blockers: parking_lot::RwLock<RangeBlockedList>,
 
     /// Current in-flight write that do not allow concurrent writes to the same region.
-    strong_write_blockers: std::sync::RwLock<RangeBlockedList>,
+    strong_write_blockers: parking_lot::RwLock<RangeBlockedList>,
 }
 
 /// A list of ranges blocked for some kind of concurrent access.
@@ -61,8 +61,8 @@ struct RangeBlocked {
     /// When the corresponding `RangeBlockedGuard` is dropped, these will all be awoken (via
     /// `oneshot::Sender::send(())`).
     ///
-    /// Normal non-async mutex, so do not await while locked!
-    waitlist: std::sync::Mutex<Vec<Sender<()>>>,
+    /// Plain (parking_lot) mutex, not an async one, so do not await while locked!
+    waitlist: parking_lot::Mutex<Vec<Sender<()>>>,
 
     /// Index in the corresponding `RangeBlockedList.blocked` list, so it can be dropped quickly.
     ///
@@ -83,7 +83,7 @@ struct RangeBlocked {
 #[derive(Debug)]
 pub struct RangeBlockedGuard<'a> {
     /// List where this blocker resides.
-    list: &'a std::sync::RwLock<RangeBlockedList>,
+    list: &'a parking_lot::RwLock<RangeBlockedList>,
 
     /// `Option`, so `drop()` can `take()` it and unwrap the `Arc`.
     ///
@@ -112,8 +112,8 @@ impl CommonStorageHelper {
         // `RangeBlockedGuard::drop()` will run, removing the blocker from the list
         let guard = {
             // Consistent ordering to avoid deadlock: Always acquire weak before strong
-            let mut weak = self.weak_write_blockers.write().unwrap();
-            let strong = self.strong_write_blockers.read().unwrap();
+            let mut weak = self.weak_write_blockers.write();
+            let strong = self.strong_write_blockers.read();
 
             strong.collect_intersecting(&range, &mut intersecting);
 
@@ -156,8 +156,8 @@ impl CommonStorageHelper {
         // `RangeBlockedGuard::drop()` will run, removing the blocker from the list
         let guard = {
             // Consistent ordering to avoid deadlock: Always acquire weak before strong
-            let weak = self.weak_write_blockers.read().unwrap();
-            let mut strong = self.strong_write_blockers.write().unwrap();
+            let weak = self.weak_write_blockers.read();
+            let mut strong = self.strong_write_blockers.write();
 
             weak.collect_intersecting(&range, &mut intersecting);
             strong.collect_intersecting(&range, &mut intersecting);
@@ -185,14 +185,13 @@ impl CommonStorageHelper {
     ///
     /// In sync mode, blocking on `recv()` to wait for an overlapping blocker held by the same
     /// thread would deadlock, because that blocker can only be released by this (now blocked)
-    /// thread.  This check runs before any locks are acquired so that a panic does not poison
-    /// them, allowing already-held guards to drop cleanly during unwinding.
+    /// thread.
     #[cfg(all(feature = "sync", debug_assertions))]
     fn assert_no_same_thread_overlap(
-        list: &std::sync::RwLock<RangeBlockedList>,
+        list: &parking_lot::RwLock<RangeBlockedList>,
         range: &Range<u64>,
     ) {
-        let list = list.read().unwrap();
+        let list = list.read();
         let current = std::thread::current().id();
         for rb in &list.blocked {
             if rb.range.overlaps(range) && rb.owner_thread == current {
@@ -224,7 +223,7 @@ impl RangeBlockedList {
                 #[cfg(feature = "sync")]
                 let (s, r) = mpsc::channel();
 
-                range_block.waitlist.lock().unwrap().push(s);
+                range_block.waitlist.lock().push(s);
                 intersecting.push(r);
             }
         }
@@ -252,7 +251,7 @@ impl Drop for RangeBlockedGuard<'_> {
         let block = self.block.take().unwrap();
 
         {
-            let mut list = self.list.write().unwrap();
+            let mut list = self.list.write();
             let i = block.index.load(Ordering::Relaxed);
             let removed = list.blocked.swap_remove(i);
             debug_assert!(Arc::ptr_eq(&removed, &block));
@@ -262,7 +261,7 @@ impl Drop for RangeBlockedGuard<'_> {
         }
 
         let block = Arc::into_inner(block).unwrap();
-        let waitlist = block.waitlist.into_inner().unwrap();
+        let waitlist = block.waitlist.into_inner();
         for waiting in waitlist {
             // If the receiving end was dropped (e.g. because the request was dropped), then just
             // ignore that

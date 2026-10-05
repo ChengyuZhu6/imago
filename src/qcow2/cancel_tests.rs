@@ -53,7 +53,7 @@ async fn test_dropped_write_vs_discard_and_realloc() {
     // Issue a write to guest cluster 0, and drop its future while it is still in flight
     state.hold_writes.store(true, Ordering::Relaxed);
     assert!(image.write(&[0x22u8; 512][..], 0).now_or_never().is_none());
-    assert_eq!(state.held.lock().unwrap().len(), 1);
+    assert_eq!(state.held.lock().len(), 1);
     state.hold_writes.store(false, Ordering::Relaxed);
 
     // Free guest cluster 0’s host cluster
@@ -90,17 +90,17 @@ async fn test_dropped_l1_entry_write_vs_l1_growth_and_realloc() {
     let mut image = create_image(&state, 64 * 1024).await;
 
     // L1 table offset from the image header
-    let l1_offset = u64::from_be_bytes(state.data.lock().unwrap()[40..48].try_into().unwrap());
+    let l1_offset = u64::from_be_bytes(state.data.lock()[40..48].try_into().unwrap());
     assert_ne!(l1_offset, 0);
 
     // Issue a write to guest cluster 0, which allocates an L2 table, and drop its future while its
     // L1 entry write is still in flight
-    *state.hold_range.lock().unwrap() = Some(l1_offset..(l1_offset + 512));
+    *state.hold_range.lock() = Some(l1_offset..(l1_offset + 512));
     state.hold_writes.store(true, Ordering::Relaxed);
     assert!(image.write(&[0x22u8; 512][..], 0).now_or_never().is_none());
-    assert_eq!(state.held.lock().unwrap().len(), 1);
+    assert_eq!(state.held.lock().len(), 1);
     state.hold_writes.store(false, Ordering::Relaxed);
-    *state.hold_range.lock().unwrap() = None;
+    *state.hold_range.lock() = None;
 
     // Grow the L1 table beyond its first cluster (64 entries of 32 KiB each), freeing the old one
     image
@@ -130,14 +130,7 @@ async fn test_dropped_l1_entry_write_vs_l1_growth_and_realloc() {
 /// Return the cluster-aligned host offset (assuming a cluster size of 512) of the first held
 /// write, which must exist.
 fn first_held_cluster(state: &MemStorageState) -> u64 {
-    state
-        .held
-        .lock()
-        .unwrap()
-        .first()
-        .expect("Expected a held write")
-        .0
-        & !511
+    state.held.lock().first().expect("Expected a held write").0 & !511
 }
 
 /// If a write allocating a new data cluster is cancelled while copying data into it (COW), the
@@ -190,7 +183,7 @@ async fn test_failed_cow_frees_cluster() {
     state.fail_next_write.store(true, Ordering::Relaxed);
     image.write(&[0x22u8; 256][..], 512).await.unwrap_err();
     let failed_cluster = {
-        let failed = state.failed.lock().unwrap();
+        let failed = state.failed.lock();
         assert_eq!(failed.len(), 1, "Expected exactly one failed write");
         failed[0] & !511
     };
@@ -214,7 +207,7 @@ async fn open_image(state: &Arc<MemStorageState>) -> FormatAccess<MemStorage> {
 
 /// Read a big-endian 64-bit value from the storage.
 fn read_u64(state: &MemStorageState, offset: u64) -> u64 {
-    let data = state.data.lock().unwrap();
+    let data = state.data.lock();
     let offset = offset as usize;
     u64::from_be_bytes(data[offset..offset + 8].try_into().unwrap())
 }
@@ -285,7 +278,7 @@ async fn test_compressed_read_vs_cow() {
     let mut read_buf = [0u8; 512];
     let mut read = Box::pin(image.read(&mut read_buf[..], guest_offset));
     assert!(read.as_mut().poll(&mut cx).is_pending());
-    assert_eq!(*state.held_reads.lock().unwrap(), [compressed_host_offset]);
+    assert_eq!(*state.held_reads.lock(), [compressed_host_offset]);
     state.hold_reads.store(false, Ordering::Relaxed);
 
     // Concurrently overwrite guest cluster 1, replacing the compressed mapping, which frees the
@@ -335,7 +328,7 @@ async fn test_compressed_read_vs_mapping_change() {
     state.hold_reads.store(true, Ordering::Relaxed);
     let mut cow_write = Box::pin(image.write(&[0x55u8; 256][..], guest_offset));
     assert!(cow_write.as_mut().poll(&mut cx).is_pending());
-    assert!(!state.held_reads.lock().unwrap().is_empty());
+    assert!(!state.held_reads.lock().is_empty());
     state.hold_reads.store(false, Ordering::Relaxed);
 
     // Start reading guest cluster 1: `get_mapping()` returns a special mapping, then reading it

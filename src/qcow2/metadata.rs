@@ -3007,7 +3007,8 @@ fn decode_binary<T: OnDiskStruct>(slice: &[u8]) -> io::Result<T> {
 mod tests {
     use super::*;
     use crate::test::mem_storage::{MemStorage, MemStorageState};
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
 
     /// Regression test: If the metadata file has alignment requirements larger than the cluster
     /// size, then `write_entry()` must not try to up-align the request to that, because having the
@@ -3053,7 +3054,7 @@ mod tests {
         l1.write_entry(&mem, test_index).await.unwrap();
 
         // Verify the entry was written
-        let data = state.data.lock().unwrap();
+        let data = state.data.lock();
         let offset = l1_offset + test_index * size_of::<u64>();
         let entry = u64::from_be_bytes(
             data[offset..(offset + size_of::<u64>())]

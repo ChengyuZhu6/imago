@@ -12,6 +12,7 @@ use crate::storage::PreallocateMode;
 use crate::{Storage, StorageCreateOptions, StorageOpenOptions};
 use cfg_if::cfg_if;
 use maybe_async::maybe_async;
+use parking_lot::RwLock;
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, Write};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -26,7 +27,6 @@ use std::os::windows::fs::{FileExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::RwLock;
 use std::{cmp, fs};
 #[cfg(unix)]
 use tracing::{debug, warn};
@@ -188,7 +188,7 @@ impl Storage for File {
 
             let len = while_eintr(|| unsafe {
                 libc::preadv(
-                    self.file.read().unwrap().as_raw_fd(),
+                    self.file.read().as_raw_fd(),
                     iovec.as_ptr(),
                     iovec.len() as libc::c_int,
                     preadv_offset,
@@ -219,7 +219,7 @@ impl Storage for File {
                     buffer.fill(0);
                     buffer.len()
                 } else {
-                    match self.file.write().unwrap().seek_read(buffer, offset)? {
+                    match self.file.write().seek_read(buffer, offset)? {
                         0 => {
                             // End of file (file is shorter than `self.size`)
                             buffer.fill(0);
@@ -247,7 +247,7 @@ impl Storage for File {
 
             // Keep holding the lock until `self.size` is updated, so that `resize()` (which takes
             // the write lock) always sees the current size
-            let file = self.file.read().unwrap();
+            let file = self.file.read();
             let len = while_eintr(|| unsafe {
                 libc::pwritev(
                     file.as_raw_fd(),
@@ -280,7 +280,7 @@ impl Storage for File {
                 // Keep holding the lock until `self.size` is updated, so that `resize()` always
                 // sees the current size
                 #[allow(clippy::readonly_write_lock)]
-                let file = self.file.write().unwrap();
+                let file = self.file.write();
                 let len = file.seek_write(buffer, offset)?;
                 if len == 0 {
                     // Should not happen, i.e. is an error
@@ -309,7 +309,7 @@ impl Storage for File {
         // the write lock, `self.size` is current, and growing (never shrinking) the file to `end`
         // cannot cut off data written concurrently.
         #[allow(clippy::readonly_write_lock)]
-        let file = self.file.write().unwrap();
+        let file = self.file.write();
         if end > self.size.load(Ordering::Relaxed) {
             file.set_len(end)?;
             self.size.fetch_max(end, Ordering::Relaxed);
@@ -327,7 +327,7 @@ impl Storage for File {
             .try_into()
             .map_err(|e| io::Error::other(format!("Discard/write-zeroes length error: {e}")))?;
 
-        let file = self.file.read().unwrap();
+        let file = self.file.read();
         // Safe: File descriptor is valid, and the rest are simple integer parameters.
         while_eintr(|| unsafe {
             libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_ZERO_RANGE, offset, length)
@@ -357,17 +357,17 @@ impl Storage for File {
     }
 
     async fn flush(&self) -> io::Result<()> {
-        self.file.write().unwrap().flush()
+        self.file.write().flush()
     }
 
     async fn sync(&self) -> io::Result<()> {
         #[cfg(target_os = "macos")]
         if self.relaxed_sync {
             // Safe: File descriptor is valid and there aren't any other arguments.
-            while_eintr(|| unsafe { libc::fsync(self.file.write().unwrap().as_raw_fd()) })?;
+            while_eintr(|| unsafe { libc::fsync(self.file.write().as_raw_fd()) })?;
             return Ok(());
         }
-        self.file.write().unwrap().sync_all()
+        self.file.write().sync_all()
     }
 
     async unsafe fn invalidate_cache(&self) -> io::Result<()> {
@@ -384,7 +384,7 @@ impl Storage for File {
     }
 
     async fn resize(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
-        let file = self.file.write().unwrap();
+        let file = self.file.write();
         let current_size = self.size.load(Ordering::Relaxed);
 
         match new_size.cmp(&current_size) {
@@ -991,7 +991,7 @@ impl File {
             .try_into()
             .map_err(|e| io::Error::other(format!("Discard/write-zeroes length error: {e}")))?;
 
-        let file = self.file.read().unwrap();
+        let file = self.file.read();
         // Safe: File descriptor is valid, and the rest are simple integer parameters.
         while_eintr(|| unsafe {
             libc::fallocate(
@@ -1022,7 +1022,7 @@ impl File {
             BeyondFinalZero: end,
         };
         let mut _returned = 0;
-        let file = self.file.read().unwrap();
+        let file = self.file.read();
         // Safe: File handle is valid, mandatory pointers (input, returned length) are passed and
         // valid, the parameter type matches the call, and the input size matches the object
         // passed.
@@ -1061,7 +1061,7 @@ impl File {
             fp_offset: offset,
             fp_length: length,
         };
-        let file = self.file.read().unwrap();
+        let file = self.file.read();
         // Safe: FD is valid, passed pointer is valid and its type matches the call.
         while_eintr(|| unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &params) })
             .map_err(Self::map_os_err)?;

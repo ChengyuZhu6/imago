@@ -5,8 +5,8 @@
 
 use super::*;
 use crate::sync_primitives::MutexGuard;
+use parking_lot::Mutex as SyncMutex;
 use std::mem;
-use std::sync::Mutex as SyncMutex;
 use tracing::{event, warn, Level};
 
 /// List of clusters that are no longer in use, and should be freed.
@@ -23,17 +23,17 @@ pub(super) struct ClustersToFreeList {
 impl ClustersToFreeList {
     /// Mark `entry` as a cluster to be freed.
     pub fn push(&self, entry: ClustersToFreeEntry) {
-        self.list.lock().unwrap().push(entry);
+        self.list.lock().push(entry);
     }
 
     /// Check whether the list is empty.
     pub fn is_empty(&self) -> bool {
-        self.list.lock().unwrap().is_empty()
+        self.list.lock().is_empty()
     }
 
     /// Remove all entries from the list and return them.
     pub fn take(&self) -> Vec<ClustersToFreeEntry> {
-        mem::take(&mut *self.list.lock().unwrap())
+        mem::take(&mut *self.list.lock())
     }
 
     /// Create a guard that enters `entry` into the list when dropped, unless disarmed.

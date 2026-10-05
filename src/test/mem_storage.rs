@@ -3,6 +3,7 @@
 use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::storage::drivers::CommonStorageHelper;
 use crate::storage::{PreallocateMode, Storage};
+use parking_lot::Mutex;
 use std::fmt::{self, Display, Formatter};
 use std::io;
 #[cfg(feature = "async")]
@@ -10,7 +11,7 @@ use std::mem;
 #[cfg(feature = "async")]
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 #[cfg(feature = "async")]
 use std::task::Poll;
 
@@ -63,7 +64,6 @@ impl MemStorageState {
 
         self.hold_range
             .lock()
-            .unwrap()
             .as_ref()
             .is_none_or(|range| offset < range.end && offset + len > range.start)
     }
@@ -72,7 +72,7 @@ impl MemStorageState {
     pub fn write(&self, offset: u64, buf: &[u8]) {
         let start = offset as usize;
         let end = start + buf.len();
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock();
         if data.len() < end {
             data.resize(end, 0);
         }
@@ -82,7 +82,7 @@ impl MemStorageState {
     /// Perform all held writes, even if their futures have been dropped.
     #[cfg(feature = "async")]
     pub fn complete_held_writes(&self) {
-        let held = mem::take(&mut *self.held.lock().unwrap());
+        let held = mem::take(&mut *self.held.lock());
         for (offset, data) in held {
             self.write(offset, &data);
         }
@@ -147,13 +147,13 @@ impl Storage for MemStorage {
     }
 
     fn size(&self) -> io::Result<u64> {
-        Ok(self.state.data.lock().unwrap().len() as u64)
+        Ok(self.state.data.lock().len() as u64)
     }
 
     async unsafe fn pure_readv(&self, mut bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
         #[cfg(feature = "async")]
         if self.state.hold_reads.load(Ordering::Relaxed) {
-            self.state.held_reads.lock().unwrap().push(offset);
+            self.state.held_reads.lock().push(offset);
             std::future::poll_fn(|_| {
                 if self.state.release_reads.load(Ordering::Relaxed) {
                     Poll::Ready(())
@@ -164,7 +164,7 @@ impl Storage for MemStorage {
             .await;
         }
 
-        let data = self.state.data.lock().unwrap();
+        let data = self.state.data.lock();
         let offset = offset as usize;
         let len = bufv.len() as usize;
         let mut bounce = vec![0u8; len];
@@ -181,13 +181,13 @@ impl Storage for MemStorage {
         bufv.copy_into_slice(&mut bounce);
 
         if self.state.fail_next_write.swap(false, Ordering::Relaxed) {
-            self.state.failed.lock().unwrap().push(offset);
+            self.state.failed.lock().push(offset);
             return Err(io::Error::other("Injected write error"));
         }
 
         #[cfg(feature = "async")]
         if self.state.should_hold(offset, bounce.len() as u64) {
-            self.state.held.lock().unwrap().push((offset, bounce));
+            self.state.held.lock().push((offset, bounce));
             // We intend to be dropped, so hold indefinitely (while internally,
             // [`MemStorageState::complete_held_writes()`] will write the data eventually)
             return std::future::pending().await;
@@ -223,7 +223,7 @@ impl Storage for MemStorage {
         if self.fixed_size {
             return Err(io::Error::other("Resize not supported"));
         }
-        self.state.data.lock().unwrap().resize(new_size as usize, 0);
+        self.state.data.lock().resize(new_size as usize, 0);
         Ok(())
     }
 }
