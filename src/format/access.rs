@@ -2,7 +2,7 @@
 //!
 //! Provides access to different image formats via `FormatAccess` objects.
 
-use super::drivers::{FormatDriverInstance, ShallowMapping};
+use super::drivers::{FormatDriverInstance, PreparedDataMapping, ShallowMapping};
 use super::PreallocateMode;
 use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::storage::ext::write_full_zeroes;
@@ -334,6 +334,9 @@ impl<S: Storage + 'static> FormatAccess<S> {
     /// discarded.  Otherwise, they are kept.
     ///
     /// Reaching the end of file before the end of the range results in an error.
+    ///
+    /// NOTE: Will be deprecated in imago 0.3 in favor of [`FormatAccess::prepare_data_mapping()`]
+    /// and [`FormatAccess::commit_data_mapping()`].
     pub async fn ensure_data_mapping(
         &self,
         offset: u64,
@@ -349,6 +352,52 @@ impl<S: Storage + 'static> FormatAccess<S> {
         let mapped_length = cmp::min(length, mapped_length);
         assert!(length == 0 || mapped_length > 0);
         Ok((storage, mapped_offset, mapped_length))
+    }
+
+    /// Prepare a raw data mapping at `offset`.
+    ///
+    /// Ensure that `offset` is directly mapped to some storage object, up to a length of `length`.
+    ///
+    /// This mapping is not immediately visible (unless it exists already); the returned
+    /// [`PreparedDataMapping`] says where to write the data for the range (storage object, offset
+    /// there, and the continuous length that was mapped, which is less than or equal to `length`).
+    /// Once that data has been written, call [`FormatAccess::commit_data_mapping()`] to make the
+    /// mapping actually visible.
+    ///
+    /// Until committed, the range keeps reading as before.  Dropping the returned object without
+    /// committing it discards the prepared mapping.
+    ///
+    /// Until the returned object is committed or dropped, any other I/O on the format layer may be
+    /// blocked.  In particular, you should not prepare any other mapping before that, unless you
+    /// can handle those calls being blocked.
+    ///
+    /// If `overwrite` is true, the contents in the range are supposed to be overwritten and may be
+    /// discarded.  Otherwise, they are kept.
+    ///
+    /// Reaching the end of file before the end of the range results in an error.
+    pub async fn prepare_data_mapping(
+        &self,
+        offset: u64,
+        length: u64,
+        overwrite: bool,
+    ) -> io::Result<PreparedDataMapping<'_, S>> {
+        self.check_disk_bounds(offset, length, "allocate")?;
+
+        let mut mapping = self
+            .inner
+            .prepare_data_mapping(offset, length, overwrite)
+            .await?;
+        mapping.limit_length(length);
+        assert!(length == 0 || mapping.length() > 0);
+        Ok(mapping)
+    }
+
+    /// Make a mapping prepared by [`FormatAccess::prepare_data_mapping()`] visible.
+    ///
+    /// Call this once the data has been written to the location given by `mapping`.  `mapping`
+    /// must have been returned by `prepare_data_mapping()` on this same object.
+    pub async fn commit_data_mapping(&self, mapping: PreparedDataMapping<'_, S>) -> io::Result<()> {
+        self.inner.commit_data_mapping(mapping).await
     }
 
     /// Read data at `offset` into `bufv`.
