@@ -99,21 +99,26 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         Ok((return_mapping, consecutive_length))
     }
 
-    /// Make the given range be mapped by data clusters.
+    /// Prepare mapping the given range by data clusters.
     ///
-    /// Underlying implementation for [`Qcow2::ensure_data_mapping()`].
+    /// Underlying implementation for [`Qcow2::prepare_data_mapping()`].
+    ///
+    /// Return the host offset to write the data to, the length that could be mapped, and, unless
+    /// the whole returned range is mapped to that host offset already, the state to pass to
+    /// [`Qcow2::do_commit_data_mapping()`] to make the mapping visible.  That state keeps the L2
+    /// table locked for modifications; dropping it frees the clusters allocated for the mapping.
     ///
     /// `skip_cow` is equivalent to [`Qcow2::ensure_data_mapping()`]’s `overwrite`: It indicates
     /// the area is to be overwritten, so COW can be skipped on it.  `skip_cow_to_eof` indicates
     /// that the mapping will go until the EOF, so no COW needs to be performed at all past
     /// `offset`.  Only use this for preallocation on resize or create.
-    pub(super) async fn do_ensure_data_mapping(
+    pub(super) async fn do_prepare_data_mapping(
         &self,
         offset: GuestOffset,
         length: u64,
         skip_cow: bool,
         skip_cow_to_eof: bool,
-    ) -> io::Result<(&S, u64, u64)> {
+    ) -> io::Result<(u64, u64, Option<PreparedMappingState>)> {
         let l2_table = self.ensure_l2(offset).await?;
 
         // Fast path for if everything is already allocated, which should be the common case at
@@ -126,26 +131,70 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             .do_get_mapping_with_l2(offset, length, &l2_table)
             .await?;
         if let ShallowMapping::Raw {
-            storage,
+            storage: _,
             offset,
             writable: true,
         } = existing.0
         {
             if existing.1 >= length {
-                return Ok((storage, offset, existing.1));
+                return Ok((offset, existing.1, None));
             }
         }
 
         let l2_table = l2_table.lock_write().await;
 
+        let mut l2_changes = Vec::new();
         let res = self
-            .ensure_data_mapping_no_cleanup(offset, length, skip_cow, skip_cow_to_eof, l2_table)
+            .prepare_data_mapping_no_cleanup(
+                offset,
+                length,
+                skip_cow,
+                skip_cow_to_eof,
+                &l2_table,
+                &mut l2_changes,
+            )
             .await;
 
-        self.process_clusters_to_free().await;
-        let (host_offset, length) = res?;
+        let (host_offset, length) = match res {
+            Ok(mapped) => mapped,
+            Err(err) => {
+                // Release what has been allocated so far
+                drop(l2_changes);
+                drop(l2_table);
+                self.process_clusters_to_free().await;
+                return Err(err);
+            }
+        };
 
-        Ok((self.storage(), host_offset, length))
+        // Everything may turn out to be mapped already, e.g. when a concurrent request has mapped
+        // it while we were waiting for the lock
+        let prepared_mapping = (!l2_changes.is_empty()).then(|| PreparedMappingState {
+            l2_table,
+            l2_changes,
+            clusters_to_free: Arc::clone(&self.clusters_to_free),
+        });
+
+        Ok((host_offset, length, prepared_mapping))
+    }
+
+    /// Make a mapping prepared by [`Qcow2::do_prepare_data_mapping()`] visible.
+    ///
+    /// Underlying implementation for [`Qcow2::commit_data_mapping()`].
+    pub(super) async fn do_commit_data_mapping(&self, state: PreparedMappingState) {
+        let PreparedMappingState {
+            mut l2_table,
+            l2_changes,
+            clusters_to_free: _,
+        } = state;
+
+        for (l2_index, host_cluster, new_allocation) in l2_changes {
+            if let Some(leaked) = l2_table.map_cluster(l2_index, host_cluster, new_allocation) {
+                self.clusters_to_free.push(leaked);
+            }
+        }
+        drop(l2_table);
+
+        self.process_clusters_to_free().await;
     }
 
     /// Make the given range be mapped by a fixed kind of clusters.
@@ -335,20 +384,22 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         Ok(l1_locked)
     }
 
-    /// Inner implementation for [`Qcow2::do_ensure_data_mapping()`].
+    /// Inner implementation for [`Qcow2::do_prepare_data_mapping()`].
     ///
-    /// Does not do any clean-up: The L2 table will probably be modified, but not written to disk.
-    /// Any existing allocations that have been removed from it (and are thus leaked) are entered
-    /// into `self.clusters_to_free`, but not freed.
+    /// Does not modify the L2 table: Whatever must be entered into it to make the mapping visible
+    /// is pushed to `l2_changes` (L2 index, host cluster, and the guard for the host cluster if it
+    /// has been newly allocated).
     ///
-    /// The caller must do both, ensuring it is done both in case of success and in case of error.
-    async fn ensure_data_mapping_no_cleanup(
+    /// Does not do any clean-up: In case of error, the caller must drop `l2_changes`, which enters
+    /// the clusters allocated so far into `self.clusters_to_free`, and free those.
+    async fn prepare_data_mapping_no_cleanup(
         &self,
         offset: GuestOffset,
         full_length: u64,
         skip_cow: bool,
         skip_cow_to_eof: bool,
-        mut l2_table: L2TableWriteGuard,
+        l2_table: &L2TableWriteGuard,
+        l2_changes: &mut Vec<(usize, HostCluster, Option<PendingClusters>)>,
     ) -> io::Result<(u64, u64)> {
         let cb = self.header.cluster_bits();
 
@@ -365,10 +416,14 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         let mut current_guest_cluster = offset.cluster(cb);
 
         // Without a mandatory host offset, this should never return `Ok(None)`
-        let host_cluster = self
-            .cow_cluster(current_guest_cluster, None, partial_skip_cow, &mut l2_table)
+        let prepared = self
+            .prepare_cow_cluster(current_guest_cluster, None, partial_skip_cow, l2_table)
             .await?
             .ok_or_else(|| io::Error::other("Internal allocation error"))?;
+        let host_cluster = prepared.host_cluster;
+        if let Some((l2_index, new_allocation)) = prepared.set_mapping {
+            l2_changes.push((l2_index, host_cluster, new_allocation));
+        }
 
         let host_offset_start = host_cluster.relative_offset(offset, cb);
         let mut allocated_length = offset.remaining_in_cluster(cb);
@@ -388,20 +443,24 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             };
 
             let next_host_cluster = current_host_cluster + ClusterCount(1);
-            let host_cluster = self
-                .cow_cluster(
+            let prepared = self
+                .prepare_cow_cluster(
                     current_guest_cluster,
                     Some(next_host_cluster),
                     partial_skip_cow,
-                    &mut l2_table,
+                    l2_table,
                 )
                 .await?;
 
-            let Some(host_cluster) = host_cluster else {
+            let Some(prepared) = prepared else {
                 // Cannot continue continuous mapping range
                 break;
             };
+            let host_cluster = prepared.host_cluster;
             assert!(host_cluster == next_host_cluster);
+            if let Some((l2_index, new_allocation)) = prepared.set_mapping {
+                l2_changes.push((l2_index, host_cluster, new_allocation));
+            }
             current_host_cluster = host_cluster;
 
             allocated_length += chunk_length as u64;
@@ -450,6 +509,44 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         }
 
         Ok(done)
+    }
+}
+
+/// State of a data mapping that has been prepared, but not committed yet.
+///
+/// Created by [`Qcow2::do_prepare_data_mapping()`], to be passed to
+/// [`Qcow2::do_commit_data_mapping()`].
+///
+/// Dropping this discards the prepared mapping, i.e. enters the clusters that have been allocated
+/// for it into the list of clusters to free.
+pub(super) struct PreparedMappingState {
+    /// Write guard on the L2 table that is to be modified.
+    ///
+    /// Held so that nobody else modifies the affected L2 entries before the mapping is committed
+    /// or dropped; in particular, nobody else may prepare a mapping for the same guest clusters.
+    ///
+    /// This also occupies an L2 cache entry for as long as it exists, because the cache only
+    /// evicts tables that nothing else refers to.  Prepared mappings are held across data I/O, so
+    /// holding several of them can pin the whole L2 cache: If no entry can be evicted, loading
+    /// another L2 table fails with an I/O error (“Cannot evict entry from cache; everything is in
+    /// use”) instead of waiting for an entry to become available.
+    l2_table: L2TableWriteGuard,
+
+    /// What to enter into the L2 table: L2 index, host cluster, and the guard for the host cluster
+    /// if it has been newly allocated.
+    l2_changes: Vec<(usize, HostCluster, Option<PendingClusters>)>,
+
+    /// The image’s list of clusters to free, to identify which image this state belongs to.
+    clusters_to_free: Arc<ClustersToFreeList>,
+}
+
+impl PreparedMappingState {
+    /// Check whether this state belongs to the given qcow2 image instance
+    pub fn belongs_to<S: Storage + 'static, F: WrappedFormat<S> + 'static>(
+        &self,
+        qcow2: &Qcow2<S, F>,
+    ) -> bool {
+        Arc::ptr_eq(&self.clusters_to_free, &qcow2.clusters_to_free)
     }
 }
 

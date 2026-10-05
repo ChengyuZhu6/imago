@@ -17,7 +17,7 @@ mod types;
 
 use crate::async_lru_cache::AsyncLruCache;
 use crate::format::builder::{FormatCreateBuilder, FormatDriverBuilder};
-use crate::format::drivers::FormatDriverInstance;
+use crate::format::drivers::{FormatDriverInstance, PreparedDataMapping};
 use crate::format::gate::{ImplicitOpenGate, PermissiveImplicitOpenGate};
 use crate::format::wrapped::WrappedFormat;
 use crate::format::{Format, PreallocateMode};
@@ -29,7 +29,7 @@ use crate::{storage, FormatAccess, ShallowMapping, Storage, StorageExt, StorageO
 use allocation::{Allocator, ClustersToFreeEntry, ClustersToFreeList, PendingClusters};
 pub use builder::{Qcow2CreateBuilder, Qcow2OpenBuilder};
 use cache::MetadataCaches;
-use mappings::FixedMapping;
+use mappings::{FixedMapping, PreparedMappingState};
 use maybe_async::maybe_async;
 use metadata::*;
 use std::fmt::{self, Debug, Display, Formatter};
@@ -510,22 +510,51 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
     }
 
     #[allow(clippy::needless_lifetimes)] // Elidable in sync, but async needs a named lifetime for the boxed future bound
-    async fn ensure_data_mapping<'a>(
+    async fn prepare_data_mapping<'a>(
         &'a self,
         offset: u64,
         length: u64,
         overwrite: bool,
-    ) -> io::Result<(&'a S, u64, u64)> {
+    ) -> io::Result<PreparedDataMapping<'a, S>> {
         self.check_disk_bounds(offset, length, "allocate")?;
 
         if length == 0 {
-            return Ok((self.storage(), 0, 0));
+            return Ok(PreparedDataMapping::existing(self.storage(), 0, 0));
         }
 
         self.need_writable()?;
-        let offset = GuestOffset(offset);
-        self.do_ensure_data_mapping(offset, length, overwrite, false)
-            .await
+        let (host_offset, length, state) = self
+            .do_prepare_data_mapping(GuestOffset(offset), length, overwrite, false)
+            .await?;
+
+        let pdm = if let Some(state) = state {
+            PreparedDataMapping::to_commit(self.storage(), host_offset, length, Box::new(state))
+        } else {
+            PreparedDataMapping::existing(self.storage(), host_offset, length)
+        };
+        Ok(pdm)
+    }
+
+    async fn commit_data_mapping(&self, mapping: PreparedDataMapping<'_, S>) -> io::Result<()> {
+        let Some(state) = mapping.into_state() else {
+            // Mapped already
+            return Ok(());
+        };
+
+        // On error, dropping the state discards the prepared mapping
+        let state = state
+            .downcast::<PreparedMappingState>()
+            .ok()
+            .filter(|state| state.belongs_to(self))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Prepared data mapping does not belong to this image",
+                )
+            })?;
+
+        self.do_commit_data_mapping(*state).await;
+        Ok(())
     }
 
     async fn ensure_zero_mapping(&self, offset: u64, length: u64) -> io::Result<(u64, u64)> {

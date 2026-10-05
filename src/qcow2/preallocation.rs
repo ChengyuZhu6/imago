@@ -65,8 +65,8 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         }
 
         while offset < max_offset {
-            let (file, fofs, flen) = self
-                .do_ensure_data_mapping(GuestOffset(offset), max_offset - offset, true, true)
+            let (fofs, flen, prepared) = self
+                .do_prepare_data_mapping(GuestOffset(offset), max_offset - offset, true, true)
                 .await?;
 
             // Data in metadata file: Allocate data areas as we go
@@ -74,15 +74,19 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
                 match storage_prealloc_mode {
                     storage::PreallocateMode::None => (), // handled below
                     storage::PreallocateMode::Zero => {
-                        file.write_zeroes(fofs, flen).await?;
+                        self.metadata.write_zeroes(fofs, flen).await?;
                     }
                     storage::PreallocateMode::Allocate => {
-                        file.write_allocated_zeroes(fofs, flen).await?;
+                        self.metadata.write_allocated_zeroes(fofs, flen).await?;
                     }
                     storage::PreallocateMode::WriteData => {
-                        write_full_zeroes(file, fofs, flen).await?;
+                        write_full_zeroes(self.metadata.as_ref(), fofs, flen).await?;
                     }
                 }
+            }
+
+            if let Some(prepared) = prepared {
+                self.do_commit_data_mapping(prepared).await;
             }
 
             offset += flen;

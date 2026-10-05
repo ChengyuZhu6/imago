@@ -5,9 +5,22 @@
 use super::*;
 use crate::io_buffers::IoBuffer;
 
+/// Host cluster prepared for a guest cluster by [`Qcow2::prepare_cow_cluster()`].
+pub(super) struct PreparedCluster {
+    /// Where data for the guest cluster is to be written to.
+    pub host_cluster: HostCluster,
+
+    /// What to pass to [`L2TableWriteGuard::map_cluster()`] to establish the mapping of guest to
+    /// host cluster (L2 index, and the guard for `host_cluster` if it has been newly allocated).
+    ///
+    /// `None` if the guest cluster is mapped to `host_cluster` already.
+    pub set_mapping: Option<(usize, Option<PendingClusters>)>,
+}
+
 #[maybe_async]
 impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
-    /// Do copy-on-write for the given guest cluster, if necessary.
+    /// Do copy-on-write for the given guest cluster, if necessary, without changing the L2 table
+    /// yet.
     ///
     /// If the given guest cluster is backed by an allocated copied data cluster, return that
     /// cluster, so it can just be written into.
@@ -18,10 +31,6 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     /// - For zero clusters, write zeroes.
     /// - For unallocated clusters, copy data from the backing file (if any, zeroes otherwise).
     /// - For compressed clusters, decompress the data and write it into the new cluster.
-    ///
-    /// Return the new cluster, if any was allocated, or the old cluster in case it was already
-    /// safe to write to.  I.e., the returned cluster is where data for `cluster` may be written
-    /// to.
     ///
     /// `cluster` is the guest cluster to COW.
     ///
@@ -34,15 +43,19 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     ///
     /// `l2_table` is the L2 table for `offset`.
     ///
-    /// If a previously existing allocation is replaced, the old one will be put into
-    /// `self.clusters_to_free`.  The caller must free it.
-    pub(super) async fn cow_cluster(
+    /// Return the mapping into which to write, which may be a newly allocated cluster or the old
+    /// cluster incase it was already safe to write to.  If the mapping requires an L2 entry to be
+    /// changed, this function does not do so, but leaves it to the caller to pass the returned
+    /// mapping information to [`L2TableWriteGuard::map_cluster()`].  Until then, `cluster` retains
+    /// its previous mapping.  The caller should set the mapping only once the data for `cluster`
+    /// has been written, so that the new cluster’s previous contents never become visible.
+    pub(super) async fn prepare_cow_cluster(
         &self,
         cluster: GuestCluster,
         mandatory_host_cluster: Option<HostCluster>,
         partial_skip_cow: Option<Range<usize>>,
-        l2_table: &mut L2TableWriteGuard,
-    ) -> io::Result<Option<HostCluster>> {
+        l2_table: &L2TableWriteGuard,
+    ) -> io::Result<Option<PreparedCluster>> {
         // No need to do COW when writing the full cluster
         let full_skip_cow = if let Some(skip) = partial_skip_cow.as_ref() {
             skip.start == 0 && skip.end == self.header.cluster_size()
@@ -61,7 +74,10 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                     return Ok(None);
                 }
             }
-            return Ok(Some(host_cluster));
+            return Ok(Some(PreparedCluster {
+                host_cluster,
+                set_mapping: None,
+            }));
         };
 
         self.need_writable()?;
@@ -137,11 +153,10 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         }
 
         let l2i = cluster.l2_index(self.header.cluster_bits());
-        if let Some(leaked) = l2_table.map_cluster(l2i, new_cluster, new_allocation) {
-            self.clusters_to_free.push(leaked);
-        }
-
-        Ok(Some(new_cluster))
+        Ok(Some(PreparedCluster {
+            host_cluster: new_cluster,
+            set_mapping: Some((l2i, new_allocation)),
+        }))
     }
 
     /// Calculate what range of a cluster we need to COW.

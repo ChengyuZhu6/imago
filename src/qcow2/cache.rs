@@ -122,6 +122,14 @@ enum CacheDependency {
 /// This structure takes care to heed those dependencies (though the general qcow2 code still needs
 /// to announce them by calling `.l2_depends_on_rb()` for allocations and `.rb_depends_on_l2()` for
 /// freeing).
+///
+/// Announcing a dependency takes the `direction` lock and flushes the other cache while holding
+/// it, so `direction` is the innermost lock: Never acquire the lock of a metadata table (such as
+/// [`L2Table`]’s write lock) while holding that direction lock.
+///
+/// Conversely, note that for an allocating write, an L2 table is held write-locked across its data
+/// I/O while its prepared data mapping is uncommitted.  Therefore, writing a table back to disk
+/// must never take that table lock, because doing so would deadlock against the still-held lock.
 pub(super) struct MetadataCaches<S: Storage> {
     /// L2 table cache
     l2: AsyncLruCache<HostCluster, L2Table, L2CacheBackend<S>>,
