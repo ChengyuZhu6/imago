@@ -694,4 +694,79 @@ mod tests {
             "discard_to_backing_unsafe",
         );
     }
+
+    /// A prepared data mapping must become visible only once it is committed; dropping it instead
+    /// must leave the range as it was, and free the cluster allocated for it.
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_prepare_commit_data_mapping() {
+        let state = Arc::new(MemStorageState::default());
+        let image = FormatAccess::new(create_image(&state, 64 * 1024, 16).await);
+        let mut buf = [0xffu8; 512];
+
+        // Allocate guest cluster 0 (so the L2 table exists)
+        image.write(&[0x11u8; 512][..], 0).await.unwrap();
+
+        // Prepare a mapping for guest cluster 1 and write data to it, but then drop it
+        let mapping = image.prepare_data_mapping(512, 512, true).await.unwrap();
+        assert!(!mapping.is_nonblocking());
+        assert_eq!(mapping.length(), 512);
+        let host_offset = mapping.offset();
+        mapping
+            .storage()
+            .write(&[0x22u8; 512][..], host_offset)
+            .await
+            .unwrap();
+
+        image.read(&mut buf[..], 512).await.unwrap();
+        assert!(buf == [0u8; 512], "Uncommitted mapping is visible");
+
+        drop(mapping);
+        image.read(&mut buf[..], 512).await.unwrap();
+        assert!(buf == [0u8; 512], "Dropped mapping is visible");
+
+        // Flushing frees the dropped mapping’s cluster, so preparing a mapping again reuses it;
+        // commit it this time
+        image.flush().await.unwrap();
+        let mapping = image.prepare_data_mapping(512, 512, true).await.unwrap();
+        assert!(!mapping.is_nonblocking());
+        assert_eq!(mapping.offset(), host_offset);
+        mapping
+            .storage()
+            .write(&[0x33u8; 512][..], host_offset)
+            .await
+            .unwrap();
+        image.commit_data_mapping(mapping).await.unwrap();
+
+        image.read(&mut buf[..], 512).await.unwrap();
+        assert!(buf == [0x33u8; 512], "Committed mapping is not visible");
+
+        // Now that the cluster is mapped, there is nothing to commit
+        let mapping = image.prepare_data_mapping(512, 512, true).await.unwrap();
+        assert!(mapping.is_nonblocking());
+        assert_eq!(mapping.offset(), host_offset);
+        image.commit_data_mapping(mapping).await.unwrap();
+    }
+
+    /// A prepared data mapping must be rejected by an image it does not belong to (and discarded).
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_commit_data_mapping_on_other_image() {
+        let state = Arc::new(MemStorageState::default());
+        let image = FormatAccess::new(create_image(&state, 64 * 1024, 16).await);
+        let other_state = Arc::new(MemStorageState::default());
+        let other_image = FormatAccess::new(create_image(&other_state, 64 * 1024, 16).await);
+
+        let mapping = image.prepare_data_mapping(0, 512, true).await.unwrap();
+        assert!(!mapping.is_nonblocking());
+        let err = other_image.commit_data_mapping(mapping).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // Nothing has been mapped in either image
+        for image in [&image, &other_image] {
+            let (mapping, _) = image.get_mapping(0, 512).await.unwrap();
+            assert!(
+                matches!(mapping, Mapping::Zero { explicit: false }),
+                "Cluster has been mapped"
+            );
+        }
+    }
 }

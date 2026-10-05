@@ -33,6 +33,20 @@ pub struct MemStorageState {
     #[cfg(feature = "async")]
     pub held: Mutex<Vec<(u64, Vec<u8>)>>,
 
+    /// While set, writes on `hold_range` do not complete until `release_writes` is set (their
+    /// offsets are entered into `delayed_writes`).  Unlike writes held via `hold_writes`, they then
+    /// complete normally.
+    #[cfg(feature = "async")]
+    pub delay_writes: AtomicBool,
+
+    /// Offsets of writes that have been delayed.
+    #[cfg(feature = "async")]
+    pub delayed_writes: Mutex<Vec<u64>>,
+
+    /// Allows delayed writes to complete.
+    #[cfg(feature = "async")]
+    pub release_writes: AtomicBool,
+
     /// If set, the next write fails (and its offset is entered into `failed`), independently of
     /// `hold_range`.
     pub fail_next_write: AtomicBool,
@@ -58,10 +72,18 @@ impl MemStorageState {
     /// Whether a write of `len` bytes to `offset` is to be held.
     #[cfg(feature = "async")]
     fn should_hold(&self, offset: u64, len: u64) -> bool {
-        if !self.hold_writes.load(Ordering::Relaxed) {
-            return false;
-        }
+        self.hold_writes.load(Ordering::Relaxed) && self.in_hold_range(offset, len)
+    }
 
+    /// Whether a write of `len` bytes to `offset` is to be delayed.
+    #[cfg(feature = "async")]
+    fn should_delay(&self, offset: u64, len: u64) -> bool {
+        self.delay_writes.load(Ordering::Relaxed) && self.in_hold_range(offset, len)
+    }
+
+    /// Whether a write of `len` bytes to `offset` intersects `hold_range`.
+    #[cfg(feature = "async")]
+    fn in_hold_range(&self, offset: u64, len: u64) -> bool {
         self.hold_range
             .lock()
             .as_ref()
@@ -183,6 +205,19 @@ impl Storage for MemStorage {
         if self.state.fail_next_write.swap(false, Ordering::Relaxed) {
             self.state.failed.lock().push(offset);
             return Err(io::Error::other("Injected write error"));
+        }
+
+        #[cfg(feature = "async")]
+        if self.state.should_delay(offset, bounce.len() as u64) {
+            self.state.delayed_writes.lock().push(offset);
+            std::future::poll_fn(|_| {
+                if self.state.release_writes.load(Ordering::Relaxed) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
         }
 
         #[cfg(feature = "async")]

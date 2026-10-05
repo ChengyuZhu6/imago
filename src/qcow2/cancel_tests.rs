@@ -353,3 +353,300 @@ async fn test_compressed_read_vs_mapping_change() {
         read_buf[256],
     );
 }
+
+/// While a write that allocates a cluster is in flight, reads of that guest cluster must not see
+/// what the cluster held before.
+///
+/// Here, the cluster had held another guest cluster’s data, was freed by a discard, and is reused.
+#[tokio::test]
+async fn test_read_during_write_to_reused_cluster() {
+    let state = Arc::new(MemStorageState::default());
+    let mut image = create_image(&state, 64 * 1024).await;
+
+    // Allocate guest cluster 0, then free its host cluster
+    image.write(&[0x11u8; 512][..], 0).await.unwrap();
+    let freed_host_offset = host_offset(&image, 0).await;
+    image.discard_to_zero(0, 512).await.unwrap();
+
+    // The freed host cluster still holds the old data
+    assert_eq!(state.data.lock()[freed_host_offset as usize], 0x11);
+
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    // Fully overwrite guest cluster 1, which must reuse that host cluster for this test to be
+    // meaningful, and keep the data write in flight
+    *state.hold_range.lock() = Some(freed_host_offset..(freed_host_offset + 512));
+    state.delay_writes.store(true, Ordering::Relaxed);
+    let mut write = Box::pin(image.write(&[0x22u8; 512][..], 512));
+    assert!(write.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(*state.delayed_writes.lock(), [freed_host_offset]);
+    state.delay_writes.store(false, Ordering::Relaxed);
+    *state.hold_range.lock() = None;
+
+    // Until the write is done, guest cluster 1 must read as before, i.e. as zeroes
+    let mut buf = [0xffu8; 512];
+    image.read(&mut buf[..], 512).await.unwrap();
+    assert!(
+        buf == [0u8; 512],
+        "Expected zeroes, read {:#04x} bytes",
+        buf[0],
+    );
+
+    // Let the write complete; it must have landed in the reused host cluster, which is now also
+    // what guest cluster 1 maps to
+    state.release_writes.store(true, Ordering::Relaxed);
+    let Poll::Ready(result) = write.as_mut().poll(&mut cx) else {
+        panic!("Write did not complete");
+    };
+    result.unwrap();
+    drop(write);
+
+    assert_eq!(host_offset(&image, 512).await, freed_host_offset);
+    let freed_host_offset = freed_host_offset as usize;
+    {
+        let data = state.data.lock();
+        assert!(
+            data[freed_host_offset..(freed_host_offset + 512)] == [0x22u8; 512],
+            "Write did not land in the reused host cluster, its first byte is {:#04x}",
+            data[freed_host_offset],
+        );
+    }
+
+    // So reading guest cluster 1 must now show the new data
+    let mut buf = [0u8; 512];
+    image.read(&mut buf[..], 512).await.unwrap();
+    assert!(
+        buf == [0x22u8; 512],
+        "Expected {:#04x} bytes, read {:#04x} bytes",
+        0x22,
+        buf[0],
+    );
+}
+
+/// While a write to a zeroed cluster that has retained its allocation is in flight, reads of that
+/// guest cluster must not see the data from before it was zeroed.
+#[tokio::test]
+async fn test_read_during_write_to_zeroed_cluster() {
+    let state = Arc::new(MemStorageState::default());
+    let image = create_image(&state, 64 * 1024).await;
+
+    // Allocate guest cluster 0, then zero it (which retains the allocation)
+    image.write(&[0x11u8; 512][..], 0).await.unwrap();
+    let retained_host_offset = host_offset(&image, 0).await;
+    image.write_zeroes(0, 512).await.unwrap();
+
+    // The host cluster keeps its allocation and its old content; only its mapping reads as zeroes
+    assert_eq!(state.data.lock()[retained_host_offset as usize], 0x11);
+
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    // Fully overwrite guest cluster 0, which must reuse the retained host cluster for this test to
+    // be meaningful, and keep the data write in flight
+    *state.hold_range.lock() = Some(retained_host_offset..(retained_host_offset + 512));
+    state.delay_writes.store(true, Ordering::Relaxed);
+    let mut write = Box::pin(image.write(&[0x22u8; 512][..], 0));
+    assert!(write.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(*state.delayed_writes.lock(), [retained_host_offset]);
+    state.delay_writes.store(false, Ordering::Relaxed);
+    *state.hold_range.lock() = None;
+
+    // Until the write is done, guest cluster 0 must read as before, i.e. as zeroes
+    let mut buf = [0xffu8; 512];
+    image.read(&mut buf[..], 0).await.unwrap();
+    assert!(
+        buf == [0u8; 512],
+        "Expected zeroes, read {:#04x} bytes",
+        buf[0],
+    );
+
+    // Let the write complete; it must have landed in the retained host cluster, which guest
+    // cluster 0 must still map to
+    state.release_writes.store(true, Ordering::Relaxed);
+    let Poll::Ready(result) = write.as_mut().poll(&mut cx) else {
+        panic!("Write did not complete");
+    };
+    result.unwrap();
+    drop(write);
+
+    assert_eq!(host_offset(&image, 0).await, retained_host_offset);
+    let retained_host_offset = retained_host_offset as usize;
+    {
+        let data = state.data.lock();
+        assert!(
+            data[retained_host_offset..(retained_host_offset + 512)] == [0x22u8; 512],
+            "Write did not land in the retained host cluster, its first byte is {:#04x}",
+            data[retained_host_offset],
+        );
+    }
+
+    // So reading guest cluster 0 must now show the new data
+    let mut buf = [0u8; 512];
+    image.read(&mut buf[..], 0).await.unwrap();
+    assert!(
+        buf == [0x22u8; 512],
+        "Expected {:#04x} bytes, read {:#04x} bytes",
+        0x22,
+        buf[0],
+    );
+}
+
+/// If the data write of a write that allocates a cluster fails, the guest cluster must keep its
+/// previous mapping, and the new cluster must be freed.
+#[tokio::test]
+async fn test_failed_write_keeps_mapping() {
+    let state = Arc::new(MemStorageState::default());
+    let image = create_image(&state, 64 * 1024).await;
+
+    // Allocate guest cluster 0 (so the L2 table exists)
+    image.write(&[0x11u8; 512][..], 0).await.unwrap();
+
+    // Fully overwrite guest cluster 1, and let the data write fail
+    state.fail_next_write.store(true, Ordering::Relaxed);
+    image.write(&[0x22u8; 512][..], 512).await.unwrap_err();
+    let failed_cluster = {
+        let failed = state.failed.lock();
+        assert_eq!(failed.len(), 1, "Expected exactly one failed write");
+        failed[0] & !511
+    };
+
+    // Guest cluster 1 must not be mapped
+    if let Mapping::Raw { offset, .. } = image.get_mapping(512, 512).await.unwrap().0 {
+        panic!("Failed write left a mapping to host offset {offset:#x}");
+    }
+
+    // Flushing frees the cluster from the failed write, so the next allocation can reuse it
+    image.flush().await.unwrap();
+    image.write(&[0x33u8; 512][..], 1024).await.unwrap();
+    assert_eq!(host_offset(&image, 1024).await, failed_cluster);
+}
+
+/// If a write that allocates a cluster is dropped while its data write is in flight, the guest
+/// cluster must keep its previous mapping, and the new cluster must be freed.
+#[tokio::test]
+async fn test_dropped_write_keeps_mapping() {
+    let state = Arc::new(MemStorageState::default());
+    let image = create_image(&state, 64 * 1024).await;
+
+    // Allocate guest cluster 0 (so the L2 table exists)
+    image.write(&[0x11u8; 512][..], 0).await.unwrap();
+
+    // Fully overwrite guest cluster 1, and drop the future while the data write is in flight
+    state.hold_writes.store(true, Ordering::Relaxed);
+    assert!(image
+        .write(&[0x22u8; 512][..], 512)
+        .now_or_never()
+        .is_none());
+    state.hold_writes.store(false, Ordering::Relaxed);
+    let dropped_cluster = first_held_cluster(&state);
+
+    // Guest cluster 1 must not be mapped
+    if let Mapping::Raw { offset, .. } = image.get_mapping(512, 512).await.unwrap().0 {
+        panic!("Dropped write left a mapping to host offset {offset:#x}");
+    }
+
+    // Flushing frees the cluster from the dropped write (after settling its writes), so the next
+    // allocation can reuse it
+    image.flush().await.unwrap();
+    image.write(&[0x33u8; 512][..], 1024).await.unwrap();
+    assert_eq!(host_offset(&image, 1024).await, dropped_cluster);
+}
+
+/// Two concurrent writes into different parts of the same unallocated cluster must both end up in
+/// it.
+#[tokio::test]
+async fn test_concurrent_writes_to_unallocated_cluster() {
+    let state = Arc::new(MemStorageState::default());
+    let mut image = create_image(&state, 64 * 1024).await;
+
+    // Allocate guest cluster 0 (so the L2 table exists), and allocate and free a host cluster, so
+    // we know where the next allocation will be
+    image.write(&[0x11u8; 512][..], 0).await.unwrap();
+    image.write(&[0x44u8; 512][..], 512).await.unwrap();
+    let host = host_offset(&image, 512).await;
+    image.discard_to_zero(512, 512).await.unwrap();
+
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    // Write the first half of guest cluster 1, delaying the data write (but not the write that
+    // fills the second half of the new cluster)
+    *state.hold_range.lock() = Some(host..(host + 256));
+    state.delay_writes.store(true, Ordering::Relaxed);
+    let mut first = Box::pin(image.write(&[0x22u8; 256][..], 512));
+    assert!(first.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(*state.delayed_writes.lock(), [host]);
+    state.delay_writes.store(false, Ordering::Relaxed);
+    *state.hold_range.lock() = None;
+
+    // Concurrently write the second half; this may or may not wait for the first write
+    let mut second = Box::pin(image.write(&[0x33u8; 256][..], 512 + 256));
+    let second_done = match second.as_mut().poll(&mut cx) {
+        Poll::Ready(result) => {
+            result.unwrap();
+            true
+        }
+        Poll::Pending => false,
+    };
+
+    // Let the first write complete
+    state.release_writes.store(true, Ordering::Relaxed);
+    let Poll::Ready(result) = first.as_mut().poll(&mut cx) else {
+        panic!("First write did not complete");
+    };
+    result.unwrap();
+    if !second_done {
+        second.await.unwrap();
+    }
+
+    let mut buf = [0u8; 512];
+    image.read(&mut buf[..], 512).await.unwrap();
+    assert!(
+        buf[..256] == [0x22u8; 256] && buf[256..] == [0x33u8; 256],
+        "Expected 0x22, then 0x33; read {:#04x}, then {:#04x}",
+        buf[0],
+        buf[256],
+    );
+}
+
+/// A write with parallelization enabled that needs several separate allocations in the same L2
+/// table must complete (and not wait for itself).
+#[tokio::test]
+async fn test_parallel_write_with_several_allocations() {
+    let state = Arc::new(MemStorageState::default());
+    let mut image = create_image(&state, 64 * 1024).await;
+    image.set_async_write_parallelization(4);
+
+    // Allocate guest clusters 0 through 3, and free the host clusters of 1 and 3, so the next two
+    // allocations are not adjacent
+    image.write(&[0x11u8; 4 * 512][..], 0).await.unwrap();
+    let first_free = host_offset(&image, 512).await;
+    let second_free = host_offset(&image, 3 * 512).await;
+    assert_ne!(second_free, first_free + 512);
+    image.discard_to_zero(512, 512).await.unwrap();
+    image.discard_to_zero(3 * 512, 512).await.unwrap();
+
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    // Write guest clusters 4 and 5 in a single request
+    let mut write = Box::pin(image.write(&[0x55u8; 2 * 512][..], 4 * 512));
+    let mut result = None;
+    for _ in 0..64 {
+        if let Poll::Ready(r) = write.as_mut().poll(&mut cx) {
+            result = Some(r);
+            break;
+        }
+    }
+    result.expect("Write did not complete").unwrap();
+    drop(write);
+
+    // This test is only meaningful if that needed two separate allocations
+    assert_eq!(host_offset(&image, 4 * 512).await, first_free);
+    assert_eq!(host_offset(&image, 5 * 512).await, second_free);
+
+    let mut buf = [0u8; 2 * 512];
+    image.read(&mut buf[..], 4 * 512).await.unwrap();
+    assert!(buf == [0x55u8; 2 * 512], "Data not read back correctly");
+}
