@@ -485,15 +485,10 @@ impl<S: Storage + 'static> FormatAccess<S> {
         let mut workers = (self.write_parallelization > 1).then(FuturesUnordered::new);
 
         while !bufv.is_empty() {
-            let (storage, st_offset, st_length) =
-                self.ensure_data_mapping(offset, bufv.len(), true).await?;
-
-            #[cfg(feature = "async")]
-            if let Some(workers) = workers.as_mut() {
-                while workers.len() >= self.write_parallelization {
-                    workers.next().await.unwrap()?;
-                }
-            }
+            let mapping = self.prepare_data_mapping(offset, bufv.len(), true).await?;
+            let storage = mapping.storage();
+            let st_offset = mapping.offset();
+            let st_length = mapping.length();
 
             let (chunk, remainder) = bufv.split_at(st_length);
             bufv = remainder;
@@ -501,12 +496,30 @@ impl<S: Storage + 'static> FormatAccess<S> {
 
             #[cfg(feature = "async")]
             if let Some(workers) = workers.as_mut() {
-                workers.push(storage.writev(chunk, st_offset));
-            } else {
-                storage.writev(chunk, st_offset).await?;
+                if mapping.is_nonblocking() {
+                    // We can only parallelize writes with non-blocking mappings.
+
+                    while workers.len() >= self.write_parallelization {
+                        workers.next().await.unwrap()?;
+                    }
+
+                    workers.push(async move {
+                        storage.writev(chunk, st_offset).await?;
+                        self.commit_data_mapping(mapping).await
+                    });
+
+                    continue;
+                }
+
+                // In case we have a blocking mapping, we need to drain the ongoing requests before
+                // going on, because they would not be polled while we await our write.  If one of
+                // them is in the middle of a write and holds a write blocker that intersects with
+                // ours, we would wait for it forever.
+                while workers.next().await.transpose()?.is_some() {}
             }
-            #[cfg(feature = "sync")]
-            storage.writev(chunk, st_offset)?;
+
+            storage.writev(chunk, st_offset).await?;
+            self.commit_data_mapping(mapping).await?;
         }
 
         #[cfg(feature = "async")]
@@ -655,13 +668,18 @@ impl<S: Storage + 'static> FormatAccess<S> {
                 ShallowMapping::Special { offset: _ } => None,
             };
 
-            let (file, mofs, mlen) = if let Some((file, mofs)) = mapping {
-                (file, mofs, mlen)
+            let mlen = if let Some((file, mofs)) = mapping {
+                write_full_zeroes(file, mofs, mlen).await?;
+                mlen
             } else {
-                self.ensure_data_mapping(offset, mlen, true).await?
+                // Need a new mapping to write zeroes into
+                let mapping = self.prepare_data_mapping(offset, mlen, true).await?;
+                let mlen = mapping.length();
+                write_full_zeroes(mapping.storage(), mapping.offset(), mlen).await?;
+                self.commit_data_mapping(mapping).await?;
+                mlen
             };
 
-            write_full_zeroes(file, mofs, mlen).await?;
             offset += mlen;
             length -= mlen;
         }
