@@ -43,11 +43,11 @@ enum VmdkStorage<S: Storage + 'static> {
 /// VMDK extent information after parsing, before opening
 #[derive(Debug)]
 enum VmdkParsedStorage {
-    /// A FLAT extent with a RAW file starting from the exact offset
+    /// A FLAT extent with a RAW file starting from the descriptor offset
     Flat {
         /// Path to storage object containing linear (raw) data
         filename: String,
-        /// Offset in the storage object where the data for this extent begins
+        /// Offset in sectors where the data for this extent begins
         offset: u64,
     },
     /// A zero-filled extent
@@ -287,6 +287,11 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Vmdk<S, F> {
 
         let storage = match storage {
             VmdkParsedStorage::Flat { filename, offset } => {
+                let offset = offset.checked_mul(VMDK_SECTOR_SIZE).ok_or_else(|| {
+                    invalid_data(format!(
+                        "Extent storage offset overflow: {offset} * {VMDK_SECTOR_SIZE}"
+                    ))
+                })?;
                 let absolute = self
                     .descriptor_file
                     .resolve_relative_path(filename)
@@ -302,10 +307,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Vmdk<S, F> {
                     .await
                     .err_context(|| format!("Data storage file {absolute:?}"))?;
 
-                VmdkStorage::Flat {
-                    file,
-                    offset: *offset,
-                }
+                VmdkStorage::Flat { file, offset }
             }
 
             VmdkParsedStorage::Zero => VmdkStorage::Zero,
