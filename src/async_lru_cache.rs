@@ -226,26 +226,16 @@ impl<
 
             trace!("Removing entry with key {oldest_key:?}, aged {}", oldest.0);
 
-            let oldest_entry = map.remove(&oldest_key).unwrap();
-
+            // Flush the entry while it is still in the map, and only remove it once that has
+            // succeeded: If flushing fails, or this future is dropped before flushing is done, the
+            // entry must remain in the cache, or its modifications would be lost.
             // We checked `strong_count` above to be 1, and there are no weak references, so the
-            // only reference to this entry must have been the one in the map.  We held the write
-            // lock throughout, there was no await point between the check and here, so the
-            // `strong_count` must still be 1 and we can thus safely unwrap the `Arc`.
-            let evicted_object = Arc::try_unwrap(oldest_entry.value.unwrap())
-                .unwrap_or_else(|_| panic!("entry has gained external references"));
-
+            // only reference to this entry is the one in the map.  We hold the write lock
+            // throughout, so nobody can gain a new reference while we flush.
             trace!("Flushing {oldest_key:?}");
-            if let Err(err) = self.backend.flush(oldest_key, &evicted_object).await {
-                map.insert(
-                    oldest_key,
-                    AsyncLruCacheEntry {
-                        value: Some(Arc::new(evicted_object)),
-                        last_used: oldest_entry.last_used.load(Ordering::Relaxed).into(),
-                    },
-                );
-                return Err(err);
-            }
+            let oldest_entry = map.get(&oldest_key).unwrap();
+            self.backend.flush(oldest_key, oldest_entry.value()).await?;
+            map.remove(&oldest_key);
         }
 
         Ok(true)
