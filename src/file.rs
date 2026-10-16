@@ -284,7 +284,25 @@ impl Storage for File {
     }
 
     async unsafe fn pure_write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
-        self.discard_to_zero(offset, length).await
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| io::Error::other("Write-zeroes wrap-around"))?;
+
+        // Only zeroes the part inside of the file
+        self.discard_to_zero(offset, length).await?;
+
+        // Unlike discarding, writing zeroes must grow the file if the range reaches past its end.
+        // Everything that grows the file updates `self.size` while holding `self.file`, so under
+        // the write lock, `self.size` is current, and growing (never shrinking) the file to `end`
+        // cannot cut off data written concurrently.
+        #[allow(clippy::readonly_write_lock)]
+        let file = self.file.write().unwrap();
+        if end > self.size.load(Ordering::Relaxed) {
+            file.set_len(end)?;
+            self.size.fetch_max(end, Ordering::Relaxed);
+        }
+
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
