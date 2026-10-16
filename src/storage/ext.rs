@@ -282,7 +282,10 @@ impl<S: Storage> StorageExt for S {
         let unaligned_end = offset
             .checked_add(length)
             .ok_or_else(|| io::Error::other("Discard wrap-around"))?;
-        let aligned_offset = (offset + align_mask) & !align_mask;
+        let aligned_offset = offset
+            .checked_add(align_mask)
+            .ok_or_else(|| io::Error::other("Discard wrap-around"))?
+            & !align_mask;
         let aligned_end = unaligned_end & !align_mask;
 
         if aligned_end > aligned_offset {
@@ -390,7 +393,10 @@ pub(crate) async fn write_efficient_zeroes<S: StorageExt>(
     let unaligned_end = offset
         .checked_add(length)
         .ok_or_else(|| io::Error::other("Zero-write wrap-around"))?;
-    let aligned_offset = (offset + align_mask) & !align_mask;
+    let aligned_offset = offset
+        .checked_add(align_mask)
+        .ok_or_else(|| io::Error::other("Zero-write wrap-around"))?
+        & !align_mask;
     let aligned_end = unaligned_end & !align_mask;
 
     if aligned_end > aligned_offset {
