@@ -8,8 +8,8 @@ use crate::io_buffers::IoVectorMut;
 use crate::{FormatAccess, Storage};
 use maybe_async::maybe_async;
 use std::any::Any;
-use std::fmt::{Debug, Display};
-use std::io;
+use std::fmt::{self, Debug, Display};
+use std::{cmp, io};
 
 /// Implementation of a disk image format.
 #[maybe_async(?Send)]
@@ -115,13 +115,87 @@ pub trait FormatDriverInstance: Any + Debug + Display + Send + Sync {
     /// mappings.  Making them unused, but retaining them as allocated so they can safely be
     /// written to (albeit with no effect) is OK; discarding them so that they may be reused for
     /// other mappings is not.
+    ///
+    /// NOTE: Will be deprecated in imago 0.3 in favor of
+    /// [`FormatDriverInstance::prepare_data_mapping()`] and
+    /// [`FormatDriverInstance::commit_data_mapping()`].
     #[allow(clippy::needless_lifetimes)] // Elidable in sync, but async needs a named lifetime for the boxed future bound
     async fn ensure_data_mapping<'a>(
         &'a self,
         offset: u64,
         length: u64,
         overwrite: bool,
-    ) -> io::Result<(&'a Self::Storage, u64, u64)>;
+    ) -> io::Result<(&'a Self::Storage, u64, u64)> {
+        let mapping = self.prepare_data_mapping(offset, length, overwrite).await?;
+        let storage = mapping.storage();
+        let host_offset = mapping.offset();
+        let length = mapping.length();
+
+        self.commit_data_mapping(mapping).await?;
+
+        Ok((storage, host_offset, length))
+    }
+
+    /// Prepare a raw data mapping at `offset`.
+    ///
+    /// Ensure that `offset` is directly mapped to some storage object, up to a length of `length`.
+    ///
+    /// This mapping needs not be immediately visible (unless it exists already); the returned
+    /// [`PreparedDataMapping`] will tell the user where to write the data for the range, and once
+    /// that data has been written, [`FormatDriverInstance::commit_data_mapping()`] is called to
+    /// finalize it and make the mapping actually visible.
+    ///
+    /// When the returned object is dropped without having been committed, the range must keep its
+    /// previous mapping, and whatever was allocated for the prepared mapping must be released.
+    ///
+    /// Drivers may delay any other I/O on the image until the returned object is committed or
+    /// dropped.
+    ///
+    /// If `overwrite` is true, the contents in the range are supposed to be overwritten and may be
+    /// discarded.  Otherwise, they should be kept.
+    ///
+    /// The default implementation is based on [`FormatDriverInstance::ensure_data_mapping()`],
+    /// i.e. makes the mapping visible immediately and leaves nothing to commit.
+    ///
+    /// NOTE: Starting from the imago 0.3 release, this function will no longer have a default
+    /// implementation.  Then, *this* function will need to be implemented, *not*
+    /// [`FormatDriverInstance::ensure_data_mapping()`].
+    #[allow(clippy::needless_lifetimes)] // Elidable in sync, but async needs a named lifetime for the boxed future bound
+    async fn prepare_data_mapping<'a>(
+        &'a self,
+        offset: u64,
+        length: u64,
+        overwrite: bool,
+    ) -> io::Result<PreparedDataMapping<'a, Self::Storage>> {
+        let (storage, offset, length) = self.ensure_data_mapping(offset, length, overwrite).await?;
+        Ok(PreparedDataMapping::existing(storage, offset, length))
+    }
+
+    /// Make a mapping prepared by [`FormatDriverInstance::prepare_data_mapping()`] visible.
+    ///
+    /// Must only be called once the data has been written to the prepared location.  `mapping`
+    /// must have been returned by `prepare_data_mapping()` on this same object.
+    ///
+    /// The default implementation matches the default implementation of
+    /// [`FormatDriverInstance::prepare_data_mapping()`], which leaves nothing to commit.
+    ///
+    /// NOTE: Starting from the imago 0.3 release, this function will no longer have a default
+    /// implementation, and will have to be implemented together with
+    /// [`FormatDriverInstance::prepare_data_mapping()`].
+    async fn commit_data_mapping(
+        &self,
+        mapping: PreparedDataMapping<'_, Self::Storage>,
+    ) -> io::Result<()> {
+        if mapping.into_state().is_some() {
+            // The default implementation of `prepare_data_mapping()` left nothing to commit, so if
+            // there is something now, it came from a different implementation.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Prepared data mapping does not belong to this image",
+            ));
+        }
+        Ok(())
+    }
 
     /// Ensure that the given range is efficiently mapped as zeroes.
     ///
@@ -256,6 +330,29 @@ pub trait FormatDriverInstance: Any + Debug + Display + Send + Sync {
         Err(io::ErrorKind::Unsupported.into())
     }
 
+    /// Read data from a `ShallowMapping::Special` area, returning the unhandled tail.
+    ///
+    /// Like [`Self::readv_special()`], but if the area turns out not to be special (anymore) from
+    /// some point on (e.g. because a concurrent write has changed its mapping), stop there and
+    /// return that unhandled tail of `bufv` and its offset.  That tail has not been written to, so
+    /// the caller can read it according to its current (non-special) mapping.
+    ///
+    /// Return `None` if the whole area has been read.
+    ///
+    /// The default implementation calls [`Self::readv_special()`], so never returns a tail.
+    ///
+    /// NOTE: Starting from the imago 0.3 release, this function will no longer have a default
+    /// implementation building on [`Self::readv_special()`], and instead will return an error.
+    /// Then, *this* function will need to be implemented, *not* [`Self::readv_special()`].
+    async fn try_readv_special<'a>(
+        &self,
+        bufv: IoVectorMut<'a>,
+        offset: u64,
+    ) -> io::Result<Option<(IoVectorMut<'a>, u64)>> {
+        self.readv_special(bufv, offset).await?;
+        Ok(None)
+    }
+
     /// Flush internal buffers.
     ///
     /// Does not need to ensure those buffers are synced to disk (hardware), and does not need to
@@ -295,6 +392,107 @@ pub trait FormatDriverInstance: Any + Debug + Display + Send + Sync {
     ///
     /// If the current size is already `new_size` or smaller, do nothing.
     async fn resize_shrink(&mut self, new_size: u64) -> io::Result<()>;
+}
+
+/// Data mapping that has been prepared, but not committed yet.
+///
+/// Returned by [`FormatAccess::prepare_data_mapping()`]: Says where to write the data for the
+/// range that is to be mapped.  Once that data has been written, pass this object to
+/// [`FormatAccess::commit_data_mapping()`] to make the mapping visible.
+///
+/// Dropping this object without committing it discards any prepared mapping change.
+///
+/// Until this object is committed or dropped, any other I/O on the image may wait for it.
+#[must_use = "prepared mappings must be committed to complete the write operation"]
+pub struct PreparedDataMapping<'a, S: Storage + 'static> {
+    /// Storage object to write the data to.
+    storage: &'a S,
+
+    /// Offset in `storage` to write the data to.
+    offset: u64,
+
+    /// Length of the mapping.
+    length: u64,
+
+    /// Driver-specific state required to commit this mapping; `None` if nothing needs to be
+    /// committed.
+    state: Option<Box<dyn Any>>,
+}
+
+impl<'a, S: Storage + 'static> PreparedDataMapping<'a, S> {
+    /// Create a prepared mapping that does not require anything to be committed.
+    ///
+    /// For use by format drivers, e.g. when the mapping exists already.
+    pub fn existing(storage: &'a S, offset: u64, length: u64) -> Self {
+        PreparedDataMapping {
+            storage,
+            offset,
+            length,
+            state: None,
+        }
+    }
+
+    /// Create a prepared mapping that must be committed, using the driver-specific `state`.
+    ///
+    /// For use by format drivers.  Dropping `state` must discard the prepared mapping.
+    pub fn to_commit(storage: &'a S, offset: u64, length: u64, state: Box<dyn Any>) -> Self {
+        PreparedDataMapping {
+            storage,
+            offset,
+            length,
+            state: Some(state),
+        }
+    }
+
+    /// Storage object to write the data to.
+    pub fn storage(&self) -> &'a S {
+        self.storage
+    }
+
+    /// Offset in [`Self::storage()`] to write the data to.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Length of the mapping.
+    pub fn length(&self) -> u64 {
+        self.length
+    }
+
+    /// Whether holding this object can delay other I/O on the image.
+    ///
+    /// `true` means the range only becomes visible once it is committed, and other I/O on the
+    /// image may be blocked in order not to interfere with that.
+    ///
+    /// `false` means holding it will never delay other I/O.  In this case, the mapping is visible
+    /// already: the range keeps reading as it does now, and committing it will most likely do
+    /// nothing ([`FormatAccess::commit_data_mapping()`] must still be called by users, though).
+    pub fn is_nonblocking(&self) -> bool {
+        self.state.is_none()
+    }
+
+    /// Take the driver-specific state, if any.
+    ///
+    /// For use by format drivers.
+    pub fn into_state(self) -> Option<Box<dyn Any>> {
+        self.state
+    }
+
+    /// Limit the length of the mapping to `max_length`.
+    pub(crate) fn limit_length(&mut self, max_length: u64) {
+        self.length = cmp::min(self.length, max_length);
+    }
+}
+
+impl<S: Storage + 'static> Debug for PreparedDataMapping<'_, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreparedDataMapping")
+            .field("storage", &self.storage)
+            .field("offset", &self.offset)
+            .field("length", &self.length)
+            .field("has_state", &self.state.is_some())
+            .finish()
+    }
 }
 
 /// Non-recursive mapping information.

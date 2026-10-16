@@ -127,11 +127,13 @@ pub mod qcow2;
 pub mod raw;
 pub mod storage;
 mod sync_primitives;
+#[cfg(test)]
+mod test;
 pub mod vmdk;
 
 pub use format::access::{FormatAccess, Mapping};
 pub use format::builder::{FormatCreateBuilder, FormatDriverBuilder};
-pub use format::drivers::ShallowMapping;
+pub use format::drivers::{PreparedDataMapping, ShallowMapping};
 pub use format::gate::{DenyImplicitOpenGate, PermissiveImplicitOpenGate};
 #[cfg(feature = "sync-wrappers")]
 pub use format::sync_wrappers::SyncFormatAccess;

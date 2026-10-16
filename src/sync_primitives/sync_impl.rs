@@ -1,42 +1,33 @@
-//! Wrappers around `std::sync` types that hide lock poisoning by panicking in case of it.
+//! Wrappers around `parking_lot` lock types, where necessary.
 
-use std::sync::{
-    Mutex as StdMutex, MutexGuard, RwLock as StdRwLock, RwLockReadGuard, RwLockWriteGuard,
-};
+use std::sync::Arc;
 
-/// Wrapper around [`std::sync::Mutex`], panicking on poisoned locks.
+/// Guard for read access to an [`OwnedRwLock`], to which it has a strong reference.
+pub(crate) type OwnedRwLockReadGuard<T> =
+    parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, T>;
+
+/// Guard for write access to an [`OwnedRwLock`], to which it has a strong reference.
+pub(crate) type OwnedRwLockWriteGuard<T> =
+    parking_lot::ArcRwLockWriteGuard<parking_lot::RawRwLock, T>;
+
+/// Read-write lock whose guards own the lock, so a guard can outlive its owner.
 #[derive(Debug, Default)]
-pub(crate) struct Mutex<T>(StdMutex<T>);
+pub(crate) struct OwnedRwLock<T>(Arc<parking_lot::RwLock<T>>);
 
-impl<T> Mutex<T> {
-    /// Create a new mutex.
-    pub fn new(t: T) -> Self {
-        Mutex(StdMutex::new(t))
-    }
-
-    /// Lock the mutex, propagating poison as a panic.
-    pub fn lock(&self) -> MutexGuard<'_, T> {
-        self.0.lock().expect("lock poisoned")
+impl<T> Clone for OwnedRwLock<T> {
+    fn clone(&self) -> Self {
+        OwnedRwLock(Arc::clone(&self.0))
     }
 }
 
-/// Wrapper around [`std::sync::RwLock`], panicking on poisoned locks.
-#[derive(Debug, Default)]
-pub(crate) struct RwLock<T>(StdRwLock<T>);
-
-impl<T> RwLock<T> {
-    /// Create a new read-write lock.
-    pub fn new(t: T) -> Self {
-        RwLock(StdRwLock::new(t))
+impl<T> OwnedRwLock<T> {
+    /// Acquire an owned read lock.
+    pub fn read(&self) -> OwnedRwLockReadGuard<T> {
+        self.0.read_arc()
     }
 
-    /// Acquire a read lock, propagating poison as a panic.
-    pub fn read(&self) -> RwLockReadGuard<'_, T> {
-        self.0.read().expect("lock poisoned")
-    }
-
-    /// Acquire a write lock, propagating poison as a panic.
-    pub fn write(&self) -> RwLockWriteGuard<'_, T> {
-        self.0.write().expect("lock poisoned")
+    /// Acquire an owned write lock.
+    pub fn write(&self) -> OwnedRwLockWriteGuard<T> {
+        self.0.write_arc()
     }
 }

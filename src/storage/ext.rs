@@ -101,6 +101,10 @@ impl<S: Storage> StorageExt for S {
             return Ok(());
         }
 
+        let unpadded_end = offset
+            .checked_add(bufv.len())
+            .ok_or_else(|| io::Error::other("Read wrap-around"))?;
+
         let mem_align = self.mem_align();
         let req_align = self.req_align();
 
@@ -120,14 +124,18 @@ impl<S: Storage> StorageExt for S {
         let len_align_mask = req_align_mask | (mem_align as u64 - 1);
         debug_assert!((len_align_mask + 1).is_multiple_of(req_align as u64));
 
-        let unpadded_end = offset + bufv.len();
         let padded_offset = offset & !req_align_mask;
         // This will over-align at the end of file (aligning to exactly the end of file would be
         // sufficient), but it is easier this way.
-        let padded_end = (unpadded_end + req_align_mask) & !req_align_mask;
+        let padded_end = unpadded_end
+            .checked_add(req_align_mask)
+            .ok_or_else(|| io::Error::other("Read wrap-around"))?
+            & !req_align_mask;
         // Now also align to memory alignment
         let padded_len = (padded_end - padded_offset + len_align_mask) & !(len_align_mask);
-        let padded_end = padded_offset + padded_len;
+        let padded_end = padded_offset
+            .checked_add(padded_len)
+            .ok_or_else(|| io::Error::other("Read wrap-around"))?;
 
         let padded_len: usize = (padded_end - padded_offset)
             .try_into()
@@ -154,11 +162,15 @@ impl<S: Storage> StorageExt for S {
             return Ok(());
         }
 
+        let unpadded_end = offset
+            .checked_add(bufv.len())
+            .ok_or_else(|| io::Error::other("Write wrap-around"))?;
+
         let mem_align = self.mem_align();
         let req_align = self.req_align();
 
         if is_aligned(&bufv, offset, mem_align, req_align) {
-            let _sw_guard = self.weak_write_blocker(offset..(offset + bufv.len())).await;
+            let _sw_guard = self.weak_write_blocker(offset..unpadded_end).await;
 
             // Safe: Alignment checked, and weak write blocker set up
             return unsafe { self.pure_writev(bufv, offset) }.await;
@@ -176,16 +188,20 @@ impl<S: Storage> StorageExt for S {
         let len_align = req_align_mask + 1;
         debug_assert!(len_align.is_multiple_of(req_align));
 
-        let unpadded_end = offset + bufv.len();
         let padded_offset = offset & !(req_align_mask as u64);
         // This will over-align at the end of file (aligning to exactly the end of file would be
         // sufficient), but it is easier this way.  Small TODO, as this will indeed increase the
         // file length (which the over-alignment in `unaligned_readv()` does not).
-        let padded_end = (unpadded_end + req_align_mask as u64) & !(req_align_mask as u64);
+        let padded_end = unpadded_end
+            .checked_add(req_align_mask as u64)
+            .ok_or_else(|| io::Error::other("Write wrap-around"))?
+            & !(req_align_mask as u64);
         // Now also align to memory alignment
         let padded_len =
             (padded_end - padded_offset + len_align_mask as u64) & !(len_align_mask as u64);
-        let padded_end = padded_offset + padded_len;
+        let padded_end = padded_offset
+            .checked_add(padded_len)
+            .ok_or_else(|| io::Error::other("Write wrap-around"))?;
 
         let padded_len: usize = (padded_end - padded_offset)
             .try_into()
@@ -266,7 +282,10 @@ impl<S: Storage> StorageExt for S {
         let unaligned_end = offset
             .checked_add(length)
             .ok_or_else(|| io::Error::other("Discard wrap-around"))?;
-        let aligned_offset = (offset + align_mask) & !align_mask;
+        let aligned_offset = offset
+            .checked_add(align_mask)
+            .ok_or_else(|| io::Error::other("Discard wrap-around"))?
+            & !align_mask;
         let aligned_end = unaligned_end & !align_mask;
 
         if aligned_end > aligned_offset {
@@ -374,7 +393,10 @@ pub(crate) async fn write_efficient_zeroes<S: StorageExt>(
     let unaligned_end = offset
         .checked_add(length)
         .ok_or_else(|| io::Error::other("Zero-write wrap-around"))?;
-    let aligned_offset = (offset + align_mask) & !align_mask;
+    let aligned_offset = offset
+        .checked_add(align_mask)
+        .ok_or_else(|| io::Error::other("Zero-write wrap-around"))?
+        & !align_mask;
     let aligned_end = unaligned_end & !align_mask;
 
     if aligned_end > aligned_offset {
@@ -442,4 +464,60 @@ pub(crate) async fn write_efficient_zeroes<S: StorageExt>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test::mem_storage::{MemStorage, MemStorageState};
+    use std::sync::Arc;
+
+    /// Requests whose end, or padded end, is beyond `u64::MAX` must return an error.
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn readv_writev_overflow() {
+        let state = Arc::new(MemStorageState::default());
+        let mut buf = vec![0u8; 8192];
+
+        // (`.await` must not be used inside of macros, or `maybe_async` will not remove it)
+
+        // Aligned: end overflows
+        let mem = MemStorage::new(Arc::clone(&state), false);
+        let offset = u64::MAX - 4095;
+        let result = mem.read(&mut buf[..], offset).await;
+        assert!(result.is_err());
+        let result = mem.write(&buf[..], offset).await;
+        assert!(result.is_err());
+
+        // Unaligned (request alignment 4096): end overflows
+        let mem = MemStorage::new(state, false).with_align(4096);
+        let offset = u64::MAX - 10;
+        let result = mem.read(&mut buf[..100], offset).await;
+        assert!(result.is_err());
+        let result = mem.write(&buf[..100], offset).await;
+        assert!(result.is_err());
+
+        // Unaligned: end does not overflow, but padded end does
+        let offset = u64::MAX - 100;
+        let result = mem.read(&mut buf[..50], offset).await;
+        assert!(result.is_err());
+        let result = mem.write(&buf[..50], offset).await;
+        assert!(result.is_err());
+    }
+
+    /// Discard and write-zeroes requests whose start, aligned up, is beyond `u64::MAX` must return
+    /// an error.
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn discard_write_zeroes_overflow() {
+        // Discard and zero alignment default to the request alignment
+        let mem = MemStorage::new(Arc::new(MemStorageState::default()), false).with_align(4096);
+
+        // End does not overflow, but the start aligned up does
+        let offset = u64::MAX - 10;
+        let result = mem.discard(offset, 5).await;
+        assert!(result.is_err());
+        let result = mem.write_zeroes(offset, 5).await;
+        assert!(result.is_err());
+        let result = mem.write_allocated_zeroes(offset, 5).await;
+        assert!(result.is_err());
+    }
 }

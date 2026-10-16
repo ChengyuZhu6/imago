@@ -389,7 +389,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> FormatCreateBuilder<S>
 
         let mut rt = RefTable::from_data(Box::new([]), &header).clone_and_grow(&header, 0)?;
         rt.set_cluster(HostCluster(1));
-        rt.enter_refblock(0, &rb)?;
+        rt.enter_refblock(0, &rb, None)?;
         rt.write(&image).await?;
 
         header.set_reftable(&rt)?;

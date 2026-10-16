@@ -12,6 +12,7 @@ use crate::storage::PreallocateMode;
 use crate::{Storage, StorageCreateOptions, StorageOpenOptions};
 use cfg_if::cfg_if;
 use maybe_async::maybe_async;
+use parking_lot::RwLock;
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, Write};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -26,10 +27,11 @@ use std::os::windows::fs::{FileExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::RwLock;
 use std::{cmp, fs};
 #[cfg(unix)]
 use tracing::{debug, warn};
+#[cfg(windows)]
+use windows_sys::Win32;
 #[cfg(windows)]
 use windows_sys::Win32::System::Ioctl::{FILE_ZERO_DATA_INFORMATION, FSCTL_SET_ZERO_DATA};
 #[cfg(windows)]
@@ -186,7 +188,7 @@ impl Storage for File {
 
             let len = while_eintr(|| unsafe {
                 libc::preadv(
-                    self.file.read().unwrap().as_raw_fd(),
+                    self.file.read().as_raw_fd(),
                     iovec.as_ptr(),
                     iovec.len() as libc::c_int,
                     preadv_offset,
@@ -217,7 +219,14 @@ impl Storage for File {
                     buffer.fill(0);
                     buffer.len()
                 } else {
-                    self.file.write().unwrap().seek_read(buffer, offset)?
+                    match self.file.write().seek_read(buffer, offset)? {
+                        0 => {
+                            // End of file (file is shorter than `self.size`)
+                            buffer.fill(0);
+                            buffer.len()
+                        }
+                        len => len,
+                    }
                 };
                 offset = offset
                     .checked_add(len as u64)
@@ -236,9 +245,12 @@ impl Storage for File {
                 .try_into()
                 .map_err(|_| io::Error::other("Write offset overflow"))?;
 
+            // Keep holding the lock until `self.size` is updated, so that `resize()` (which takes
+            // the write lock) always sees the current size
+            let file = self.file.read();
             let len = while_eintr(|| unsafe {
                 libc::pwritev(
-                    self.file.read().unwrap().as_raw_fd(),
+                    file.as_raw_fd(),
                     iovec.as_ptr(),
                     iovec.len() as libc::c_int,
                     pwritev_offset,
@@ -265,7 +277,15 @@ impl Storage for File {
         for buffer in bufv.into_inner() {
             let mut buffer: &[u8] = &buffer;
             while !buffer.is_empty() {
-                let len = self.file.write().unwrap().seek_write(buffer, offset)?;
+                // Keep holding the lock until `self.size` is updated, so that `resize()` always
+                // sees the current size
+                #[allow(clippy::readonly_write_lock)]
+                let file = self.file.write();
+                let len = file.seek_write(buffer, offset)?;
+                if len == 0 {
+                    // Should not happen, i.e. is an error
+                    return Err(io::ErrorKind::WriteZero.into());
+                }
                 offset = offset
                     .checked_add(len as u64)
                     .ok_or_else(|| io::Error::other("Write offset overflow"))?;
@@ -277,7 +297,25 @@ impl Storage for File {
     }
 
     async unsafe fn pure_write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
-        self.discard_to_zero(offset, length).await
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| io::Error::other("Write-zeroes wrap-around"))?;
+
+        // Only zeroes the part inside of the file
+        self.discard_to_zero(offset, length).await?;
+
+        // Unlike discarding, writing zeroes must grow the file if the range reaches past its end.
+        // Everything that grows the file updates `self.size` while holding `self.file`, so under
+        // the write lock, `self.size` is current, and growing (never shrinking) the file to `end`
+        // cannot cut off data written concurrently.
+        #[allow(clippy::readonly_write_lock)]
+        let file = self.file.write();
+        if end > self.size.load(Ordering::Relaxed) {
+            file.set_len(end)?;
+            self.size.fetch_max(end, Ordering::Relaxed);
+        }
+
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -289,12 +327,16 @@ impl Storage for File {
             .try_into()
             .map_err(|e| io::Error::other(format!("Discard/write-zeroes length error: {e}")))?;
 
-        let file = self.file.read().unwrap();
+        let file = self.file.read();
         // Safe: File descriptor is valid, and the rest are simple integer parameters.
         while_eintr(|| unsafe {
             libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_ZERO_RANGE, offset, length)
         })
         .map_err(Self::map_os_err)?;
+
+        // Without `FALLOC_FL_KEEP_SIZE`, this may have grown the file
+        self.size
+            .fetch_max(offset as u64 + length as u64, Ordering::Relaxed);
 
         Ok(())
     }
@@ -315,17 +357,17 @@ impl Storage for File {
     }
 
     async fn flush(&self) -> io::Result<()> {
-        self.file.write().unwrap().flush()
+        self.file.write().flush()
     }
 
     async fn sync(&self) -> io::Result<()> {
         #[cfg(target_os = "macos")]
         if self.relaxed_sync {
             // Safe: File descriptor is valid and there aren't any other arguments.
-            while_eintr(|| unsafe { libc::fsync(self.file.write().unwrap().as_raw_fd()) })?;
+            while_eintr(|| unsafe { libc::fsync(self.file.write().as_raw_fd()) })?;
             return Ok(());
         }
-        self.file.write().unwrap().sync_all()
+        self.file.write().sync_all()
     }
 
     async unsafe fn invalidate_cache(&self) -> io::Result<()> {
@@ -342,7 +384,7 @@ impl Storage for File {
     }
 
     async fn resize(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
-        let file = self.file.write().unwrap();
+        let file = self.file.write();
         let current_size = self.size.load(Ordering::Relaxed);
 
         match new_size.cmp(&current_size) {
@@ -886,45 +928,44 @@ impl File {
 
     /// For special operations, ensure the error kind is usable.
     ///
-    /// For non-UNIX systems, this is an identity map.
-    #[cfg(not(unix))]
+    /// Rust’s std maps neither `ERROR_NOT_SUPPORTED` nor `ERROR_INVALID_FUNCTION` (which is what
+    /// file systems generally return for control codes they do not support) to
+    /// [`io::ErrorKind::Unsupported`].
+    ///
+    /// Assign the appropriate error kind to such errors so the generic code can handle them.
+    #[cfg(windows)]
+    fn map_os_err(err: io::Error) -> io::Error {
+        let Some(raw) = err.raw_os_error() else {
+            return err;
+        };
+
+        let has_kind = err.kind();
+        let want_kind = match raw as u32 {
+            Win32::Foundation::ERROR_NOT_SUPPORTED | Win32::Foundation::ERROR_INVALID_FUNCTION => {
+                io::ErrorKind::Unsupported
+            }
+            _ => has_kind,
+        };
+
+        if has_kind != want_kind {
+            io::Error::new(want_kind, err)
+        } else {
+            err
+        }
+    }
+
+    /// For special operations, ensure the error kind is usable.
+    ///
+    /// For systems other than UNIX and Windows, this is an identity map.
+    #[cfg(not(any(unix, windows)))]
     fn map_os_err(err: io::Error) -> io::Error {
         err
     }
 
-    /// Attempt to discard range by truncating the file.
-    ///
-    /// If the range reaches the end of the file, truncate and restore the original file length.
-    /// Return `true` on success.
-    ///
-    /// If the range is not at the end of the file, i.e. another method of discarding is needed,
-    /// return `false`.
-    fn try_discard_by_truncate(&self, offset: u64, length: u64) -> io::Result<bool> {
-        // Prevent modifications to the file length
-        #[allow(clippy::readonly_write_lock)]
-        let file = self.file.write().unwrap();
-
-        let size = self.size.load(Ordering::Relaxed);
-        if offset >= size {
-            // Nothing to do
-            return Ok(true);
-        }
-
-        // If `offset + length` overflows, we can just assume it ends at `size`.  (Anything past
-        // `size is irrelevant anyway.)
-        let end = offset.checked_add(length).unwrap_or(size);
-        if end < size {
-            return Ok(false);
-        }
-
-        file.set_len(offset)?;
-        file.set_len(size)?;
-        Ok(true)
-    }
-
     /// Ensure the given range reads back as zeroes, or return an error.
     async fn discard_to_zero(&self, offset: u64, length: u64) -> io::Result<()> {
-        if self.try_discard_by_truncate(offset, length)? {
+        if offset >= self.size.load(Ordering::Relaxed) {
+            // Nothing to do
             return Ok(());
         }
 
@@ -950,7 +991,7 @@ impl File {
             .try_into()
             .map_err(|e| io::Error::other(format!("Discard/write-zeroes length error: {e}")))?;
 
-        let file = self.file.read().unwrap();
+        let file = self.file.read();
         // Safe: File descriptor is valid, and the rest are simple integer parameters.
         while_eintr(|| unsafe {
             libc::fallocate(
@@ -981,7 +1022,7 @@ impl File {
             BeyondFinalZero: end,
         };
         let mut _returned = 0;
-        let file = self.file.read().unwrap();
+        let file = self.file.read();
         // Safe: File handle is valid, mandatory pointers (input, returned length) are passed and
         // valid, the parameter type matches the call, and the input size matches the object
         // passed.
@@ -1020,7 +1061,7 @@ impl File {
             fp_offset: offset,
             fp_length: length,
         };
-        let file = self.file.read().unwrap();
+        let file = self.file.read();
         // Safe: FD is valid, passed pointer is valid and its type matches the call.
         while_eintr(|| unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &params) })
             .map_err(Self::map_os_err)?;
@@ -1127,15 +1168,16 @@ mod ioctl {
 #[cfg(test)]
 mod tests {
     use super::File;
-    use crate::{Storage, StorageExt, StorageOpenOptions};
+    use crate::{Storage, StorageCreateOptions, StorageExt};
+    use std::path::PathBuf;
     #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
-    use std::{fs, io};
+    use std::{cmp, env, fs, io};
 
     #[cfg(windows)]
     #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
     async fn zero_data_preserves_the_byte_at_the_exclusive_end() {
-        let path = std::env::temp_dir().join(format!(
+        let path = test_dir().join(format!(
             "imago-zero-data-boundary-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -1155,11 +1197,35 @@ mod tests {
 
         let contents = fs::read(&path);
         let _ = fs::remove_file(&path);
+        if zero_result
+            .as_ref()
+            .is_err_and(|err| err.kind() == io::ErrorKind::Unsupported)
+        {
+            // Nothing to test (e.g. on Wine)
+            return;
+        }
         zero_result.unwrap();
         let contents = contents.unwrap();
         assert_eq!(contents[4095], 0x5a);
         assert!(contents[4096..8192].iter().all(|byte| *byte == 0));
         assert_eq!(contents[8192], 0x5a);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn map_os_err_unsupported() {
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED,
+        };
+
+        for code in [ERROR_NOT_SUPPORTED, ERROR_INVALID_FUNCTION] {
+            let err = File::map_os_err(io::Error::from_raw_os_error(code as i32));
+            assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        }
+
+        // Other errors must keep their kind
+        let err = File::map_os_err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[cfg(unix)]
@@ -1169,7 +1235,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
+        let path = test_dir().join(format!(
             "imago-buffered-probe-{}-{unique}",
             std::process::id()
         ));
@@ -1199,7 +1265,18 @@ mod tests {
         assert_eq!(len, 0);
     }
 
-    struct TempPath(std::path::PathBuf);
+    /// Directory for test files.
+    ///
+    /// Taken from the `TEST_DIR` environment variable, falling back to [`env::temp_dir()`].  The
+    /// latter is often a tmpfs, which does not support all operations (e.g. `fallocate()` with
+    /// `FALLOC_FL_ZERO_RANGE`), so some code paths are only tested with fallbacks there.
+    fn test_dir() -> PathBuf {
+        env::var_os("TEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(env::temp_dir)
+    }
+
+    struct TempPath(PathBuf);
 
     impl Drop for TempPath {
         fn drop(&mut self) {
@@ -1207,24 +1284,152 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
     async fn tail_discard_keeps_file_length() -> io::Result<()> {
-        let path =
-            std::env::temp_dir().join(format!("imago-tail-discard-{}.raw", std::process::id()));
+        let path = test_dir().join(format!("imago-tail-discard-{}.raw", std::process::id()));
+        let _temp_path = TempPath(path.clone());
+
+        let file = File::create_open(StorageCreateOptions::new().filename(&path)).await?;
+        // To actually exercise the discard path, use the reported discard alignment as the test
+        // granularity (at least 4096).
+        let granularity = cmp::max(file.discard_align(), 4096) as u64;
+        file.write(&vec![0xabu8; 2 * granularity as usize][..], 0)
+            .await?;
+        assert_eq!(std::fs::metadata(&path)?.len(), 2 * granularity);
+
+        file.discard(granularity, granularity).await?;
+        assert_eq!(std::fs::metadata(&path)?.len(), 2 * granularity);
+
+        let mut prefix = vec![0u8; granularity as usize];
+        file.read(&mut prefix, 0).await?;
+        assert_eq!(prefix, vec![0xabu8; granularity as usize]);
+
+        // If discarding is not supported (e.g. on Wine), it is a no-op
+        if !file
+            .discard_unsupported
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let mut tail = vec![0xffu8; granularity as usize];
+            file.read(&mut tail, granularity).await?;
+            assert!(tail.iter().all(|&byte| byte == 0));
+        }
+
+        io::Result::Ok(())
+    }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn write_allocated_zeroes_past_eof_updates_size() -> io::Result<()> {
+        let path = test_dir().join(format!(
+            "imago-allocated-zeroes-past-eof-{}.raw",
+            std::process::id()
+        ));
+        let _temp_path = TempPath(path.clone());
+
+        let file = File::create_open(StorageCreateOptions::new().filename(&path)).await?;
+        // To actually exercise the efficient zero-write path, use the reported zero alignment as
+        // the test granularity (at least 4096).
+        let granularity = cmp::max(file.zero_align(), 4096) as u64;
+
+        file.write(&vec![0xabu8; granularity as usize][..], 0)
+            .await?;
+        assert_eq!(fs::metadata(&path)?.len(), granularity);
+        assert_eq!(file.size()?, granularity);
+
+        file.write_allocated_zeroes(granularity, granularity)
+            .await?;
+        assert_eq!(fs::metadata(&path)?.len(), 2 * granularity);
+        assert_eq!(file.size()?, 2 * granularity);
+
+        let mut tail = vec![0xffu8; granularity as usize];
+        file.read(&mut tail, granularity).await?;
+        assert!(tail.iter().all(|&byte| byte == 0));
+
+        io::Result::Ok(())
+    }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn write_zeroes_past_eof_grows_file() -> io::Result<()> {
+        let path = test_dir().join(format!(
+            "imago-write-zeroes-past-eof-{}.raw",
+            std::process::id()
+        ));
+        let _temp_path = TempPath(path.clone());
+
+        let file = File::create_open(StorageCreateOptions::new().filename(&path)).await?;
+        // To actually exercise the efficient zero-write path, use the reported zero alignment as
+        // the test granularity (at least 4096).
+        let granularity = cmp::max(file.zero_align(), 4096) as u64;
+        file.write(&vec![0xabu8; granularity as usize][..], 0)
+            .await?;
+        assert_eq!(fs::metadata(&path)?.len(), granularity);
+        assert_eq!(file.size()?, granularity);
+
+        // Range starting at EOF
+        file.write_zeroes(granularity, granularity).await?;
+        assert_eq!(fs::metadata(&path)?.len(), 2 * granularity);
+        assert_eq!(file.size()?, 2 * granularity);
+
+        let mut buf = vec![0u8; 2 * granularity as usize];
+        file.read(&mut buf, 0).await?;
+        assert!(buf[..granularity as usize].iter().all(|&byte| byte == 0xab));
+        assert!(buf[granularity as usize..].iter().all(|&byte| byte == 0));
+
+        // Range crossing EOF
+        file.write(&vec![0xcdu8; granularity as usize][..], granularity)
+            .await?;
+        file.write_zeroes(granularity, 2 * granularity).await?;
+        assert_eq!(fs::metadata(&path)?.len(), 3 * granularity);
+        assert_eq!(file.size()?, 3 * granularity);
+
+        let mut buf = vec![0xffu8; 3 * granularity as usize];
+        file.read(&mut buf, 0).await?;
+        assert!(buf[..granularity as usize].iter().all(|&byte| byte == 0xab));
+        assert!(buf[granularity as usize..].iter().all(|&byte| byte == 0));
+
+        io::Result::Ok(())
+    }
+
+    /// Reading past the actual end of file must work even if `File::size` is larger.
+    #[cfg(windows)]
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn read_past_external_truncation() -> io::Result<()> {
+        use crate::StorageOpenOptions;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let path = test_dir().join(format!(
+            "imago-read-past-external-truncation-{}.raw",
+            std::process::id()
+        ));
         let _temp_path = TempPath(path.clone());
         std::fs::write(&path, vec![0xabu8; 8192])?;
 
-        let file = File::open(StorageOpenOptions::new().write(true).filename(&path)).await?;
-        file.discard(4096, 4096).await?;
-        assert_eq!(std::fs::metadata(&path)?.len(), 8192);
+        let file = File::open(StorageOpenOptions::new().filename(&path)).await?;
+        // Truncate behind `file`'s back, so its cached size is too large
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .set_len(4096)?;
 
-        let mut prefix = vec![0u8; 4096];
-        file.read(&mut prefix, 0).await?;
-        assert_eq!(prefix, vec![0xabu8; 4096]);
+        // When broken, reading spins forever; abort instead of hanging
+        let done = Arc::new(AtomicBool::new(false));
+        let watchdog_done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(10));
+            if !watchdog_done.load(Ordering::Relaxed) {
+                eprintln!("read_past_external_truncation: Read hangs, aborting");
+                std::process::abort();
+            }
+        });
 
-        let mut tail = vec![0xffu8; 4096];
-        file.read(&mut tail, 4096).await?;
-        assert!(tail.iter().all(|&byte| byte == 0));
+        let mut buf = vec![0xffu8; 8192];
+        file.read(&mut buf[..], 0).await?;
+        done.store(true, Ordering::Relaxed);
+
+        assert!(buf[..4096].iter().all(|&byte| byte == 0xab));
+        assert!(buf[4096..].iter().all(|&byte| byte == 0));
 
         io::Result::Ok(())
     }

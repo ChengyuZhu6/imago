@@ -226,26 +226,16 @@ impl<
 
             trace!("Removing entry with key {oldest_key:?}, aged {}", oldest.0);
 
-            let oldest_entry = map.remove(&oldest_key).unwrap();
-
+            // Flush the entry while it is still in the map, and only remove it once that has
+            // succeeded: If flushing fails, or this future is dropped before flushing is done, the
+            // entry must remain in the cache, or its modifications would be lost.
             // We checked `strong_count` above to be 1, and there are no weak references, so the
-            // only reference to this entry must have been the one in the map.  We held the write
-            // lock throughout, there was no await point between the check and here, so the
-            // `strong_count` must still be 1 and we can thus safely unwrap the `Arc`.
-            let evicted_object = Arc::try_unwrap(oldest_entry.value.unwrap())
-                .unwrap_or_else(|_| panic!("entry has gained external references"));
-
+            // only reference to this entry is the one in the map.  We hold the write lock
+            // throughout, so nobody can gain a new reference while we flush.
             trace!("Flushing {oldest_key:?}");
-            if let Err(err) = self.backend.flush(oldest_key, &evicted_object).await {
-                map.insert(
-                    oldest_key,
-                    AsyncLruCacheEntry {
-                        value: Some(Arc::new(evicted_object)),
-                        last_used: oldest_entry.last_used.load(Ordering::Relaxed).into(),
-                    },
-                );
-                return Err(err);
-            }
+            let oldest_entry = map.get(&oldest_key).unwrap();
+            self.backend.flush(oldest_key, oldest_entry.value()).await?;
+            map.remove(&oldest_key);
         }
 
         Ok(true)
@@ -465,7 +455,7 @@ mod tests {
     /// Backend that records flush calls in order
     #[derive(Default)]
     struct RecordingBackend {
-        flushed: std::sync::Mutex<Vec<(usize, usize)>>,
+        flushed: parking_lot::Mutex<Vec<(usize, usize)>>,
     }
 
     #[maybe_async(AFIT)]
@@ -478,7 +468,7 @@ mod tests {
         }
 
         async fn flush(&self, key: usize, value: &usize) -> io::Result<()> {
-            self.flushed.lock().unwrap().push((key, *value));
+            self.flushed.lock().push((key, *value));
             Ok(())
         }
 
@@ -568,7 +558,7 @@ mod tests {
         assert_eq!(entry, None);
         cache.get_or_insert(ENTRIES, true).await.unwrap().unwrap();
 
-        assert_eq!(*backend.flushed.lock().unwrap(), [(1, 1)]);
+        assert_eq!(*backend.flushed.lock(), [(1, 1)]);
     }
 
     /// Entries with external `Arc` references must not be evicted
@@ -585,7 +575,7 @@ mod tests {
         assert_eq!(entry, None);
         cache.get_or_insert(2, true).await.unwrap().unwrap();
 
-        assert_eq!(*backend.flushed.lock().unwrap(), [(1, 1)]);
+        assert_eq!(*backend.flushed.lock(), [(1, 1)]);
         assert_eq!(*held, 0);
     }
 
@@ -691,12 +681,62 @@ mod tests {
         let inserted = cache.insert(5, Arc::new(55), true).await.unwrap();
         assert!(inserted);
 
-        assert_eq!(*backend.flushed.lock().unwrap(), [(5, 5)]);
+        assert_eq!(*backend.flushed.lock(), [(5, 5)]);
         let entry = *cache.get_or_insert(5, false).await.unwrap().unwrap();
         assert_eq!(entry, 55);
         let entry = *cache.get_or_insert(5, true).await.unwrap().unwrap();
         assert_eq!(entry, 55);
         let len = cache.0.map.read().await.len();
         assert_eq!(len, 1);
+    }
+
+    /// When the future evicting an entry is dropped while flushing it, the entry must remain in
+    /// the cache (otherwise, its modifications would be lost)
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn test_dropped_eviction_flush_keeps_entry() {
+        use futures::FutureExt;
+
+        /// Backend whose flushes never complete, and that counts loads
+        #[derive(Default)]
+        struct PendingFlushBackend {
+            loads: AtomicUsize,
+        }
+
+        #[maybe_async(AFIT)]
+        impl AsyncLruCacheBackend for PendingFlushBackend {
+            type Key = usize;
+            type Value = usize;
+
+            async fn load(&self, key: usize) -> io::Result<usize> {
+                self.loads.fetch_add(1, Ordering::Relaxed);
+                Ok(key)
+            }
+
+            async fn flush(&self, _key: usize, _value: &usize) -> io::Result<()> {
+                std::future::pending().await
+            }
+
+            unsafe fn evict(&self, _key: usize, _value: usize) {}
+        }
+
+        let backend = Arc::new(PendingFlushBackend::default());
+        let cache = AsyncLruCache::new(Arc::clone(&backend), 2);
+
+        cache.get_or_insert(0, false).await.unwrap().unwrap();
+        cache.get_or_insert(1, false).await.unwrap().unwrap();
+        assert_eq!(backend.loads.load(Ordering::Relaxed), 2);
+
+        // Evicting the oldest entry (key 0) stays pending on its flush; drop it then
+        assert!(cache.get_or_insert(2, true).now_or_never().is_none());
+
+        // Check that both keys still exist, i.e. must not need to be loaded again
+        let entry = cache.get_or_insert(0, false).await.unwrap().unwrap();
+        assert_eq!(*entry, 0);
+        let entry = cache.get_or_insert(1, false).await.unwrap().unwrap();
+        assert_eq!(*entry, 1);
+
+        // And that the number of loads did not change
+        assert_eq!(backend.loads.load(Ordering::Relaxed), 2);
     }
 }

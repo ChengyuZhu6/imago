@@ -50,11 +50,9 @@ impl<S: Storage> AsyncLruCacheBackend for L2CacheBackend<S> {
 
     async fn flush(&self, l2_cluster: HostCluster, l2_table: &L2Table) -> io::Result<()> {
         trace!("Flushing L2 table");
-        if l2_table.is_modified() {
-            assert!(l2_table.get_cluster().unwrap() == l2_cluster);
-            l2_table.write(self.file.as_ref()).await?;
-        }
-        Ok(())
+        l2_table
+            .write_if_modified(self.file.as_ref(), l2_cluster)
+            .await
     }
 
     unsafe fn evict(&self, _l2_cluster: HostCluster, l2_table: L2Table) {
@@ -85,11 +83,9 @@ impl<S: Storage> AsyncLruCacheBackend for RefBlockCacheBackend<S> {
     }
 
     async fn flush(&self, rb_cluster: HostCluster, refblock: &RefBlock) -> io::Result<()> {
-        if refblock.is_modified() {
-            assert!(refblock.get_cluster().unwrap() == rb_cluster);
-            refblock.write(self.file.as_ref()).await?;
-        }
-        Ok(())
+        refblock
+            .write_if_modified(self.file.as_ref(), rb_cluster)
+            .await
     }
 
     unsafe fn evict(&self, _rb_cluster: HostCluster, refblock: RefBlock) {
@@ -122,6 +118,19 @@ enum CacheDependency {
 /// This structure takes care to heed those dependencies (though the general qcow2 code still needs
 /// to announce them by calling `.l2_depends_on_rb()` for allocations and `.rb_depends_on_l2()` for
 /// freeing).
+///
+/// Announcing a dependency takes the `direction` lock and flushes the other cache while holding
+/// it, so `direction` is the innermost lock: Never acquire a metadata table’s `writer_lock` (the
+/// lock guarding modifications to its entries, e.g. on [`L2Table`]) while holding that direction
+/// lock.
+///
+/// Conversely, note that for an allocating write, an L2 table is held write-locked across its data
+/// I/O while its prepared data mapping is uncommitted, and allocating the clusters announces its
+/// dependency (taking the `direction` lock) while that write lock is held.  Therefore, writing a
+/// table back to disk must never take the table’s `writer_lock`, because doing so would deadlock
+/// against the still-held lock.  It does take the table’s separate `writeback_lock` (see
+/// [`L2Table::write_if_modified()`]); that is a leaf, held only across the write itself and never
+/// across anything that acquires `direction`.
 pub(super) struct MetadataCaches<S: Storage> {
     /// L2 table cache
     l2: AsyncLruCache<HostCluster, L2Table, L2CacheBackend<S>>,
@@ -218,23 +227,20 @@ impl<S: Storage> MetadataCaches<S> {
 
     /// Force-insert an L2 table.
     ///
+    /// The L2 table must have a cluster associated with it ([`L2Table::set_cluster()`]).
+    ///
     /// See [`AsyncLruCache::insert()`] for details.
-    pub async fn l2_insert(
-        &self,
-        cluster_index: HostCluster,
-        table: Arc<L2Table>,
-    ) -> io::Result<()> {
+    pub async fn l2_insert(&self, table: Arc<L2Table>) -> io::Result<()> {
+        let cluster = table
+            .get_cluster()
+            .ok_or_else(|| io::Error::other("L2 table does not have a cluster"))?;
         let dir = self.direction.read().await;
-        if !self
-            .l2
-            .insert(cluster_index, Arc::clone(&table), false)
-            .await?
-        {
+        if !self.l2.insert(cluster, Arc::clone(&table), false).await? {
             if *dir == CacheDependency::L2DependsOnRb {
                 self.rb.flush().await?;
             }
 
-            let inserted = self.l2.insert(cluster_index, table, true).await?;
+            let inserted = self.l2.insert(cluster, table, true).await?;
             // Will always insert with `may_flush` set to true.
             assert!(inserted);
         }
@@ -270,19 +276,20 @@ impl<S: Storage> MetadataCaches<S> {
 
     /// Force-insert a refblock.
     ///
+    /// The refblock must have a cluster associated with it ([`RefBlock::set_cluster()`]).
+    ///
     /// See [`AsyncLruCache::insert()`] for details.
-    pub async fn rb_insert(&self, cluster_index: HostCluster, rb: Arc<RefBlock>) -> io::Result<()> {
+    pub async fn rb_insert(&self, rb: Arc<RefBlock>) -> io::Result<()> {
+        let cluster = rb
+            .get_cluster()
+            .ok_or_else(|| io::Error::other("Refblock does not have a cluster"))?;
         let dir = self.direction.read().await;
-        if !self
-            .rb
-            .insert(cluster_index, Arc::clone(&rb), false)
-            .await?
-        {
+        if !self.rb.insert(cluster, Arc::clone(&rb), false).await? {
             if *dir == CacheDependency::RbDependsOnL2 {
                 self.l2.flush().await?;
             }
 
-            let inserted = self.rb.insert(cluster_index, rb, true).await?;
+            let inserted = self.rb.insert(cluster, rb, true).await?;
             // Will always insert with `may_flush` set to true.
             assert!(inserted);
         }
@@ -369,8 +376,8 @@ mod tests {
         rb_entry.set_cluster(HostCluster(0));
         rb_entry.clear_modified();
 
-        block_on(caches.l2_insert(HostCluster(0), Arc::new(l2_entry))).unwrap();
-        block_on(caches.rb_insert(HostCluster(0), Arc::new(rb_entry))).unwrap();
+        block_on(caches.l2_insert(Arc::new(l2_entry))).unwrap();
+        block_on(caches.rb_insert(Arc::new(rb_entry))).unwrap();
 
         let c1 = Arc::clone(&caches);
         let c2 = Arc::clone(&caches);
@@ -386,7 +393,7 @@ mod tests {
             entry.set_cluster(HostCluster(1));
             entry.clear_modified();
             bar1.wait();
-            block_on(c1.l2_insert(HostCluster(1), Arc::new(entry))).unwrap();
+            block_on(c1.l2_insert(Arc::new(entry))).unwrap();
         });
 
         // Thread 2: insert new rb entry (evicts old one)
@@ -397,7 +404,7 @@ mod tests {
             entry.set_cluster(HostCluster(1));
             entry.clear_modified();
             bar2.wait();
-            block_on(c2.rb_insert(HostCluster(1), Arc::new(entry))).unwrap();
+            block_on(c2.rb_insert(Arc::new(entry))).unwrap();
         });
 
         t1.join().unwrap();
@@ -445,10 +452,7 @@ mod tests {
         rb_entry.set_cluster(HostCluster(0));
         // Leave modified = true (new_cleared sets it)
         let rb_arc = Arc::new(rb_entry);
-        caches
-            .rb_insert(HostCluster(0), Arc::clone(&rb_arc))
-            .await
-            .unwrap();
+        caches.rb_insert(Arc::clone(&rb_arc)).await.unwrap();
 
         assert!(rb_arc.is_modified());
 
@@ -476,29 +480,20 @@ mod tests {
         let mut rb_entry = RefBlock::new_cleared(null.as_ref(), &header).unwrap();
         rb_entry.set_cluster(HostCluster(0));
         let rb_arc = Arc::new(rb_entry);
-        caches
-            .rb_insert(HostCluster(0), Arc::clone(&rb_arc))
-            .await
-            .unwrap();
+        caches.rb_insert(Arc::clone(&rb_arc)).await.unwrap();
 
         // Fill l2 cache (size 1)
         let mut l2_entry = L2Table::new_cleared(&header);
         l2_entry.set_cluster(HostCluster(0));
         l2_entry.clear_modified();
-        caches
-            .l2_insert(HostCluster(0), Arc::new(l2_entry))
-            .await
-            .unwrap();
+        caches.l2_insert(Arc::new(l2_entry)).await.unwrap();
 
         // Insert another l2 entry — triggers eviction.
         // The coordinator must flush rb (dep) before the l2 eviction.
         let mut l2_entry2 = L2Table::new_cleared(&header);
         l2_entry2.set_cluster(HostCluster(1));
         l2_entry2.clear_modified();
-        caches
-            .l2_insert(HostCluster(1), Arc::new(l2_entry2))
-            .await
-            .unwrap();
+        caches.l2_insert(Arc::new(l2_entry2)).await.unwrap();
 
         // rb must have been flushed by the dep flush
         assert!(

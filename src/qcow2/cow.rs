@@ -5,9 +5,22 @@
 use super::*;
 use crate::io_buffers::IoBuffer;
 
+/// Host cluster prepared for a guest cluster by [`Qcow2::prepare_cow_cluster()`].
+pub(super) struct PreparedCluster {
+    /// Where data for the guest cluster is to be written to.
+    pub host_cluster: HostCluster,
+
+    /// What to pass to [`L2TableWriteGuard::map_cluster()`] to establish the mapping of guest to
+    /// host cluster (L2 index, and the guard for `host_cluster` if it has been newly allocated).
+    ///
+    /// `None` if the guest cluster is mapped to `host_cluster` already.
+    pub set_mapping: Option<(usize, Option<PendingClusters>)>,
+}
+
 #[maybe_async]
 impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
-    /// Do copy-on-write for the given guest cluster, if necessary.
+    /// Do copy-on-write for the given guest cluster, if necessary, without changing the L2 table
+    /// yet.
     ///
     /// If the given guest cluster is backed by an allocated copied data cluster, return that
     /// cluster, so it can just be written into.
@@ -18,10 +31,6 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     /// - For zero clusters, write zeroes.
     /// - For unallocated clusters, copy data from the backing file (if any, zeroes otherwise).
     /// - For compressed clusters, decompress the data and write it into the new cluster.
-    ///
-    /// Return the new cluster, if any was allocated, or the old cluster in case it was already
-    /// safe to write to.  I.e., the returned cluster is where data for `cluster` may be written
-    /// to.
     ///
     /// `cluster` is the guest cluster to COW.
     ///
@@ -34,16 +43,19 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     ///
     /// `l2_table` is the L2 table for `offset`.
     ///
-    /// If a previously existing allocation is replaced, the old one will be put into
-    /// `leaked_allocations`.  The caller must free it.
-    pub(super) async fn cow_cluster(
+    /// Return the mapping into which to write, which may be a newly allocated cluster or the old
+    /// cluster incase it was already safe to write to.  If the mapping requires an L2 entry to be
+    /// changed, this function does not do so, but leaves it to the caller to pass the returned
+    /// mapping information to [`L2TableWriteGuard::map_cluster()`].  Until then, `cluster` retains
+    /// its previous mapping.  The caller should set the mapping only once the data for `cluster`
+    /// has been written, so that the new cluster’s previous contents never become visible.
+    pub(super) async fn prepare_cow_cluster(
         &self,
         cluster: GuestCluster,
         mandatory_host_cluster: Option<HostCluster>,
         partial_skip_cow: Option<Range<usize>>,
-        l2_table: &mut L2TableWriteGuard<'_>,
-        leaked_allocations: &mut Vec<(HostCluster, ClusterCount)>,
-    ) -> io::Result<Option<HostCluster>> {
+        l2_table: &L2TableWriteGuard,
+    ) -> io::Result<Option<PreparedCluster>> {
         // No need to do COW when writing the full cluster
         let full_skip_cow = if let Some(skip) = partial_skip_cow.as_ref() {
             skip.start == 0 && skip.end == self.header.cluster_size()
@@ -62,32 +74,39 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                     return Ok(None);
                 }
             }
-            return Ok(Some(host_cluster));
+            return Ok(Some(PreparedCluster {
+                host_cluster,
+                set_mapping: None,
+            }));
         };
 
         self.need_writable()?;
 
-        let new_cluster = if let L2Mapping::Zero {
+        // New cluster index, and, if newly allocated, a `PendingClusters` guard
+        let new_cluster: Option<(HostCluster, Option<PendingClusters>)> = if let L2Mapping::Zero {
             host_cluster: Some(host_cluster),
             copied: true,
         } = existing_mapping
         {
             if let Some(mandatory_host_cluster) = mandatory_host_cluster {
                 if host_cluster == mandatory_host_cluster {
-                    Some(host_cluster)
+                    Some((host_cluster, None))
                 } else {
                     // Discard existing mapping
                     self.allocate_data_cluster_at(cluster, Some(mandatory_host_cluster))
                         .await?
+                        .map(|allocation| (allocation.cluster(), Some(allocation)))
                 }
             } else {
-                Some(host_cluster)
+                Some((host_cluster, None))
             }
         } else {
             self.allocate_data_cluster_at(cluster, mandatory_host_cluster)
                 .await?
+                .map(|allocation| (allocation.cluster(), Some(allocation)))
         };
-        let Some(new_cluster) = new_cluster else {
+
+        let Some((new_cluster, new_allocation)) = new_cluster else {
             // Allocation at `mandatory_host_cluster` failed
             return Ok(None);
         };
@@ -127,21 +146,17 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 } => self.cow_zero(new_cluster, partial_skip_cow).await?,
 
                 L2Mapping::Compressed {
-                    host_offset,
-                    length,
-                } => {
-                    self.cow_compressed(host_offset, length, new_cluster)
-                        .await?
-                }
+                    host_offset: _,
+                    length: _,
+                } => self.cow_compressed(l2_table, cluster, new_cluster).await?,
             }
         }
 
         let l2i = cluster.l2_index(self.header.cluster_bits());
-        if let Some(leaked) = l2_table.map_cluster(l2i, new_cluster) {
-            leaked_allocations.push(leaked);
-        }
-
-        Ok(Some(new_cluster))
+        Ok(Some(PreparedCluster {
+            host_cluster: new_cluster,
+            set_mapping: Some((l2i, new_allocation)),
+        }))
     }
 
     /// Calculate what range of a cluster we need to COW.
@@ -271,22 +286,25 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
     /// Decompress a cluster into the target cluster.
     ///
-    /// Used for COW on compressed clusters.
+    /// Used for COW on compressed clusters.  `cluster` must be compressed in `l2_table`.
     async fn cow_compressed(
         &self,
-        compressed_offset: HostOffset,
-        compressed_length: u64,
+        l2_table: &L2TableWriteGuard,
+        cluster: GuestCluster,
         to_cluster: HostCluster,
     ) -> io::Result<()> {
         let to = self.storage();
 
+        let Some(compressed_guard) = l2_table.compressed_read_guard(cluster)? else {
+            // We hold the write guard, so the mapping cannot have changed since the caller looked
+            // it up
+            unreachable!();
+        };
+
         let mut buf = IoBuffer::new(self.header.cluster_size(), to.mem_align())?;
-        self.read_compressed_cluster(
-            buf.as_mut().into_slice(),
-            compressed_offset,
-            compressed_length,
-        )
-        .await?;
+        compressed_guard
+            .read_compressed(to, buf.as_mut().into_slice())
+            .await?;
 
         let to_offset = to_cluster.offset(self.header.cluster_bits());
         to.write(&buf, to_offset.0).await?;

@@ -3,6 +3,8 @@
 mod allocation;
 mod builder;
 mod cache;
+#[cfg(all(test, feature = "async"))]
+mod cancel_tests;
 mod compressed;
 mod cow;
 mod io_func;
@@ -15,7 +17,7 @@ mod types;
 
 use crate::async_lru_cache::AsyncLruCache;
 use crate::format::builder::{FormatCreateBuilder, FormatDriverBuilder};
-use crate::format::drivers::FormatDriverInstance;
+use crate::format::drivers::{FormatDriverInstance, PreparedDataMapping};
 use crate::format::gate::{ImplicitOpenGate, PermissiveImplicitOpenGate};
 use crate::format::wrapped::WrappedFormat;
 use crate::format::{Format, PreallocateMode};
@@ -24,10 +26,10 @@ use crate::misc_helpers::{invalid_data, ResultErrorContext};
 use crate::raw::Raw;
 use crate::sync_primitives::{Mutex, RwLock};
 use crate::{storage, FormatAccess, ShallowMapping, Storage, StorageExt, StorageOpenOptions};
-use allocation::Allocator;
+use allocation::{Allocator, ClustersToFreeEntry, ClustersToFreeList, PendingClusters};
 pub use builder::{Qcow2CreateBuilder, Qcow2OpenBuilder};
 use cache::MetadataCaches;
-use mappings::FixedMapping;
+use mappings::{FixedMapping, PreparedMappingState};
 use maybe_async::maybe_async;
 use metadata::*;
 use std::fmt::{self, Debug, Display, Formatter};
@@ -74,6 +76,11 @@ pub struct Qcow2<S: Storage + 'static, F: WrappedFormat<S> + 'static = FormatAcc
     ///
     /// Is `None` for read-only images.
     allocator: Option<Mutex<Allocator<S>>>,
+
+    /// Allocations that have been removed from the image metadata, but not yet freed.
+    ///
+    /// Shared with the allocator.  Must be freed via [`Qcow2::process_clusters_to_free()`].
+    clusters_to_free: Arc<ClustersToFreeList>,
 }
 
 #[maybe_async]
@@ -114,12 +121,14 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 
         let metadata = Arc::new(metadata);
         let caches = Arc::new(MetadataCaches::new(&metadata, &header, 128, 32));
+        let clusters_to_free = Arc::new(ClustersToFreeList::default());
 
         let allocator = if writable {
             let allocator = Allocator::new(
                 Arc::clone(&metadata),
                 Arc::clone(&header),
                 Arc::clone(&caches),
+                Arc::clone(&clusters_to_free),
             )
             .await?;
             Some(Mutex::new(allocator))
@@ -143,6 +152,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 
             caches,
             allocator,
+            clusters_to_free,
         })
     }
 
@@ -397,8 +407,8 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             .ok_or_else(|| io::Error::other("Image is read-only"))
     }
 
-    /// Check whether `length + offset` is within the disk size.
-    fn check_disk_bounds<D: Display>(&self, length: u64, offset: u64, req: D) -> io::Result<()> {
+    /// Check whether `offset + length` is within the disk size.
+    fn check_disk_bounds<D: Display>(&self, offset: u64, length: u64, req: D) -> io::Result<()> {
         let size = self.header.size();
         let length_until_eof = size.saturating_sub(offset);
         if length_until_eof >= length {
@@ -406,7 +416,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         } else {
             Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                format!("Cannot {req} beyond the disk size ({length} + {offset} > {size}"),
+                format!("Cannot {req} beyond the disk size ({length} + {offset} > {size})"),
             ))
         }
     }
@@ -500,22 +510,51 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
     }
 
     #[allow(clippy::needless_lifetimes)] // Elidable in sync, but async needs a named lifetime for the boxed future bound
-    async fn ensure_data_mapping<'a>(
+    async fn prepare_data_mapping<'a>(
         &'a self,
         offset: u64,
         length: u64,
         overwrite: bool,
-    ) -> io::Result<(&'a S, u64, u64)> {
+    ) -> io::Result<PreparedDataMapping<'a, S>> {
         self.check_disk_bounds(offset, length, "allocate")?;
 
         if length == 0 {
-            return Ok((self.storage(), 0, 0));
+            return Ok(PreparedDataMapping::existing(self.storage(), 0, 0));
         }
 
         self.need_writable()?;
-        let offset = GuestOffset(offset);
-        self.do_ensure_data_mapping(offset, length, overwrite, false)
-            .await
+        let (host_offset, length, state) = self
+            .do_prepare_data_mapping(GuestOffset(offset), length, overwrite, false)
+            .await?;
+
+        let pdm = if let Some(state) = state {
+            PreparedDataMapping::to_commit(self.storage(), host_offset, length, Box::new(state))
+        } else {
+            PreparedDataMapping::existing(self.storage(), host_offset, length)
+        };
+        Ok(pdm)
+    }
+
+    async fn commit_data_mapping(&self, mapping: PreparedDataMapping<'_, S>) -> io::Result<()> {
+        let Some(state) = mapping.into_state() else {
+            // Mapped already
+            return Ok(());
+        };
+
+        // On error, dropping the state discards the prepared mapping
+        let state = state
+            .downcast::<PreparedMappingState>()
+            .ok()
+            .filter(|state| state.belongs_to(self))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Prepared data mapping does not belong to this image",
+                )
+            })?;
+
+        self.do_commit_data_mapping(*state).await;
+        Ok(())
     }
 
     async fn ensure_zero_mapping(&self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
@@ -571,11 +610,25 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
     }
 
     async fn readv_special(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
-        let offset = GuestOffset(offset);
-        self.do_readv_special(bufv, offset).await
+        match self.do_readv_special(bufv, GuestOffset(offset)).await? {
+            None => Ok(()),
+            Some((_, tail_offset)) => Err(io::Error::other(format!(
+                "Range at {tail_offset:#x} is not compressed (anymore)"
+            ))),
+        }
+    }
+
+    async fn try_readv_special<'a>(
+        &self,
+        bufv: IoVectorMut<'a>,
+        offset: u64,
+    ) -> io::Result<Option<(IoVectorMut<'a>, u64)>> {
+        self.do_readv_special(bufv, GuestOffset(offset)).await
     }
 
     async fn flush(&self) -> io::Result<()> {
+        // Free what is pending before writing back the refblocks
+        self.process_clusters_to_free().await;
         self.caches.flush_all().await?;
         self.metadata.flush().await?;
         if let Some(storage) = self.storage.as_ref() {
@@ -595,6 +648,11 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
     }
 
     async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        // Forget clusters that were still to be freed: Freeing them would modify the image, which
+        // must not happen here, and they are unused only per our outdated view of the image
+        // anyway.  (If they really are unused, they are leaked.)
+        self.clusters_to_free.take();
+
         // Safe: Caller says we should do this
         unsafe { self.caches.invalidate_l2() }.await?;
         if let Some(allocator) = self.allocator.as_ref() {
@@ -627,6 +685,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
                 Arc::clone(&self.metadata),
                 Arc::clone(&self.header),
                 Arc::clone(&self.caches),
+                Arc::clone(&self.clusters_to_free),
             )
             .await?;
         }

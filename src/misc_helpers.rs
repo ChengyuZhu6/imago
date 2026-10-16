@@ -105,3 +105,28 @@ pub(crate) fn invalid_data<E: Into<Box<dyn std::error::Error + Send + Sync>>>(
 ) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
+
+/// Execute the inner function on drop, unless disarmed.
+pub(crate) struct DropGuard<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> DropGuard<F> {
+    /// Execute `func` when the returned object is dropped, unless [`DropGuard::disarm()`] has been
+    /// called before.
+    #[must_use]
+    pub fn new(func: F) -> Self {
+        DropGuard(Some(func))
+    }
+
+    /// Disarm the guard, preventing the contained function from being executed
+    pub fn disarm(&mut self) {
+        let _ = self.0.take();
+    }
+}
+
+impl<F: FnOnce()> Drop for DropGuard<F> {
+    fn drop(&mut self) {
+        if let Some(func) = self.0.take() {
+            func()
+        }
+    }
+}

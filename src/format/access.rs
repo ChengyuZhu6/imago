@@ -2,7 +2,7 @@
 //!
 //! Provides access to different image formats via `FormatAccess` objects.
 
-use super::drivers::{FormatDriverInstance, ShallowMapping};
+use super::drivers::{FormatDriverInstance, PreparedDataMapping, ShallowMapping};
 use super::PreallocateMode;
 use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::storage::ext::write_full_zeroes;
@@ -210,14 +210,22 @@ impl<S: Storage + 'static> FormatAccess<S> {
                 Ok(())
             }
 
-            // FIXME: TOCTTOU problem.  Not sure how to fully fix it, if possible at all.
-            // (Concurrent writes can change the mapping, but the driver will have to reload the
-            // mapping because it cannot pass it in `NonRecursiveMapping::Special`.  It may then
-            // find that this is no longer a “special” range.  Even passing the low-level mapping
-            // information in `Mapping::Special` wouldn’t fully fix it, though: If concurrent
-            // writes change the low-level cluster type, and the driver then tries to e.g.
-            // decompress the data that was there, that may well fail.)
-            Mapping::Special { layer, offset } => layer.inner.readv_special(bufv, offset).await,
+            Mapping::Special { layer, offset } => {
+                // Concurrent writes may have changed the mapping since we looked it up, so the
+                // driver may find that (some tail of) this range is no longer special. It then
+                // returns that tail (unread), which we read according to its current mapping.
+                let Some((tail, tail_offset)) = layer.inner.try_readv_special(bufv, offset).await?
+                else {
+                    return Ok(());
+                };
+
+                // Recursion, so we need to `Box::pin()` in async mode (and `return` is needed
+                // because `#[cfg()]` requires full statements ending in `;`).
+                #[cfg(feature = "async")]
+                return Box::pin(layer.readv(tail, tail_offset)).await;
+                #[cfg(feature = "sync")]
+                return layer.readv(tail, tail_offset);
+            }
         }
     }
 
@@ -281,7 +289,7 @@ impl<S: Storage + 'static> FormatAccess<S> {
                 } => {
                     format_layer = recurse_layer;
                     offset = recurse_offset;
-                    writable_gate = recurse_writable;
+                    writable_gate = writable_gate && recurse_writable;
                     max_length = length;
                 }
 
@@ -324,19 +332,72 @@ impl<S: Storage + 'static> FormatAccess<S> {
     ///
     /// If `overwrite` is true, the contents in the range are supposed to be overwritten and may be
     /// discarded.  Otherwise, they are kept.
+    ///
+    /// Reaching the end of file before the end of the range results in an error.
+    ///
+    /// NOTE: Will be deprecated in imago 0.3 in favor of [`FormatAccess::prepare_data_mapping()`]
+    /// and [`FormatAccess::commit_data_mapping()`].
     pub async fn ensure_data_mapping(
         &self,
         offset: u64,
         length: u64,
         overwrite: bool,
     ) -> io::Result<(&S, u64, u64)> {
+        self.check_disk_bounds(offset, length, "allocate")?;
+
         let (storage, mapped_offset, mapped_length) = self
             .inner
             .ensure_data_mapping(offset, length, overwrite)
             .await?;
         let mapped_length = cmp::min(length, mapped_length);
-        assert!(mapped_length > 0);
+        assert!(length == 0 || mapped_length > 0);
         Ok((storage, mapped_offset, mapped_length))
+    }
+
+    /// Prepare a raw data mapping at `offset`.
+    ///
+    /// Ensure that `offset` is directly mapped to some storage object, up to a length of `length`.
+    ///
+    /// This mapping is not immediately visible (unless it exists already); the returned
+    /// [`PreparedDataMapping`] says where to write the data for the range (storage object, offset
+    /// there, and the continuous length that was mapped, which is less than or equal to `length`).
+    /// Once that data has been written, call [`FormatAccess::commit_data_mapping()`] to make the
+    /// mapping actually visible.
+    ///
+    /// Until committed, the range keeps reading as before.  Dropping the returned object without
+    /// committing it discards the prepared mapping.
+    ///
+    /// Until the returned object is committed or dropped, any other I/O on the format layer may be
+    /// blocked.  In particular, you should not prepare any other mapping before that, unless you
+    /// can handle those calls being blocked.
+    ///
+    /// If `overwrite` is true, the contents in the range are supposed to be overwritten and may be
+    /// discarded.  Otherwise, they are kept.
+    ///
+    /// Reaching the end of file before the end of the range results in an error.
+    pub async fn prepare_data_mapping(
+        &self,
+        offset: u64,
+        length: u64,
+        overwrite: bool,
+    ) -> io::Result<PreparedDataMapping<'_, S>> {
+        self.check_disk_bounds(offset, length, "allocate")?;
+
+        let mut mapping = self
+            .inner
+            .prepare_data_mapping(offset, length, overwrite)
+            .await?;
+        mapping.limit_length(length);
+        assert!(length == 0 || mapping.length() > 0);
+        Ok(mapping)
+    }
+
+    /// Make a mapping prepared by [`FormatAccess::prepare_data_mapping()`] visible.
+    ///
+    /// Call this once the data has been written to the location given by `mapping`.  `mapping`
+    /// must have been returned by `prepare_data_mapping()` on this same object.
+    pub async fn commit_data_mapping(&self, mapping: PreparedDataMapping<'_, S>) -> io::Result<()> {
+        self.inner.commit_data_mapping(mapping).await
     }
 
     /// Read data at `offset` into `bufv`.
@@ -396,6 +457,19 @@ impl<S: Storage + 'static> FormatAccess<S> {
         self.readv(buf.into(), offset).await
     }
 
+    /// Check whether `offset + length` is within the disk size.
+    fn check_disk_bounds(&self, offset: u64, length: u64, req: &str) -> io::Result<()> {
+        let size = self.inner.size();
+        if offset <= size && length <= size - offset {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("Cannot {req} beyond the disk size ({length} + {offset} > {size})"),
+            ))
+        }
+    }
+
     /// Write data from `bufv` to `offset`.
     ///
     /// Writes all data from `bufv` (or returns an error), i.e. will not do short writes.  Reaching
@@ -405,28 +479,16 @@ impl<S: Storage + 'static> FormatAccess<S> {
             return Err(io::Error::other("Image is read-only"));
         }
 
-        // Limit to disk size
-        let disk_size = self.inner.size();
-        if offset >= disk_size {
-            return Ok(());
-        }
-        if bufv.len() > disk_size - offset {
-            bufv = bufv.split_at(disk_size - offset).0;
-        }
+        self.check_disk_bounds(offset, bufv.len(), "write")?;
 
         #[cfg(feature = "async")]
         let mut workers = (self.write_parallelization > 1).then(FuturesUnordered::new);
 
         while !bufv.is_empty() {
-            let (storage, st_offset, st_length) =
-                self.ensure_data_mapping(offset, bufv.len(), true).await?;
-
-            #[cfg(feature = "async")]
-            if let Some(workers) = workers.as_mut() {
-                while workers.len() >= self.write_parallelization {
-                    workers.next().await.unwrap()?;
-                }
-            }
+            let mapping = self.prepare_data_mapping(offset, bufv.len(), true).await?;
+            let storage = mapping.storage();
+            let st_offset = mapping.offset();
+            let st_length = mapping.length();
 
             let (chunk, remainder) = bufv.split_at(st_length);
             bufv = remainder;
@@ -434,12 +496,30 @@ impl<S: Storage + 'static> FormatAccess<S> {
 
             #[cfg(feature = "async")]
             if let Some(workers) = workers.as_mut() {
-                workers.push(storage.writev(chunk, st_offset));
-            } else {
-                storage.writev(chunk, st_offset).await?;
+                if mapping.is_nonblocking() {
+                    // We can only parallelize writes with non-blocking mappings.
+
+                    while workers.len() >= self.write_parallelization {
+                        workers.next().await.unwrap()?;
+                    }
+
+                    workers.push(async move {
+                        storage.writev(chunk, st_offset).await?;
+                        self.commit_data_mapping(mapping).await
+                    });
+
+                    continue;
+                }
+
+                // In case we have a blocking mapping, we need to drain the ongoing requests before
+                // going on, because they would not be polled while we await our write.  If one of
+                // them is in the middle of a write and holds a write blocker that intersects with
+                // ours, we would wait for it forever.
+                while workers.next().await.transpose()?.is_some() {}
             }
-            #[cfg(feature = "sync")]
-            storage.writev(chunk, st_offset)?;
+
+            storage.writev(chunk, st_offset).await?;
+            self.commit_data_mapping(mapping).await?;
         }
 
         #[cfg(feature = "async")]
@@ -588,13 +668,18 @@ impl<S: Storage + 'static> FormatAccess<S> {
                 ShallowMapping::Special { offset: _ } => None,
             };
 
-            let (file, mofs, mlen) = if let Some((file, mofs)) = mapping {
-                (file, mofs, mlen)
+            let mlen = if let Some((file, mofs)) = mapping {
+                write_full_zeroes(file, mofs, mlen).await?;
+                mlen
             } else {
-                self.ensure_data_mapping(offset, mlen, true).await?
+                // Need a new mapping to write zeroes into
+                let mapping = self.prepare_data_mapping(offset, mlen, true).await?;
+                let mlen = mapping.length();
+                write_full_zeroes(mapping.storage(), mapping.offset(), mlen).await?;
+                self.commit_data_mapping(mapping).await?;
+                mlen
             };
 
-            write_full_zeroes(file, mofs, mlen).await?;
             offset += mlen;
             length -= mlen;
         }
@@ -608,6 +693,8 @@ impl<S: Storage + 'static> FormatAccess<S> {
     /// Will not discard anything, which keeps existing data mappings usable, albeit writing to
     /// mappings that are now zeroed may have no effect.
     ///
+    /// Reaching the end of file before the end of the range results in an error.
+    ///
     /// Check if [`FormatAccess::discard_to_zero()`] better suits your needs: It may work better on
     /// a wider range of formats (`write_zeroes()` requires support for preallocated zero clusters,
     /// which qcow2 does have, but other formats may not), and can actually free up space.
@@ -617,6 +704,7 @@ impl<S: Storage + 'static> FormatAccess<S> {
         let max_offset = offset.checked_add(length).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "Write-zeroes range overflow")
         })?;
+        self.check_disk_bounds(offset, length, "write zeroes")?;
 
         while offset < max_offset {
             let (zofs, zlen) = self
@@ -645,6 +733,8 @@ impl<S: Storage + 'static> FormatAccess<S> {
     ///
     /// Areas that cannot be discarded (because of format-inherent alignment restrictions) are
     /// still overwritten with zeroes, unless discarding is not supported altogether.
+    ///
+    /// Reaching the end of file before the end of the range results in an error.
     pub async fn discard_to_zero(&mut self, offset: u64, length: u64) -> io::Result<()> {
         // Safe: `&mut self` guarantees nobody has concurrent data mappings
         unsafe { self.discard_to_zero_unsafe(offset, length).await }
@@ -674,6 +764,7 @@ impl<S: Storage + 'static> FormatAccess<S> {
                 "Discard-to-zero range overflow",
             )
         })?;
+        self.check_disk_bounds(offset, length, "discard")?;
 
         while offset < max_offset {
             // Safe: Caller guarantees this is safe
@@ -703,6 +794,8 @@ impl<S: Storage + 'static> FormatAccess<S> {
     ///
     /// Discarding being unsupported by this format is still returned as an error
     /// ([`std::io::ErrorKind::Unsupported`])
+    ///
+    /// Reaching the end of file before the end of the range results in an error.
     pub async fn discard_to_any(&mut self, offset: u64, length: u64) -> io::Result<()> {
         unsafe { self.discard_to_any_unsafe(offset, length).await }
     }
@@ -728,6 +821,7 @@ impl<S: Storage + 'static> FormatAccess<S> {
         let max_offset = offset.checked_add(length).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "Discard-to-any range overflow")
         })?;
+        self.check_disk_bounds(offset, length, "discard")?;
 
         while offset < max_offset {
             // Safe: Caller guarantees this is safe
@@ -751,6 +845,8 @@ impl<S: Storage + 'static> FormatAccess<S> {
     /// visible, and keep the rest as-is.  This breaks existing data mappings, so needs a mutable
     /// reference to `self`, which ensures that existing data references (which have the lifetime
     /// of an immutable `self` reference) cannot be kept.
+    ///
+    /// Reaching the end of file before the end of the range results in an error.
     pub async fn discard_to_backing(&mut self, offset: u64, length: u64) -> io::Result<()> {
         // Safe: `&mut self` guarantees nobody has concurrent data mappings
         unsafe { self.discard_to_backing_unsafe(offset, length).await }
@@ -781,6 +877,7 @@ impl<S: Storage + 'static> FormatAccess<S> {
                 "Discard-to-backing range overflow",
             )
         })?;
+        self.check_disk_bounds(offset, length, "discard")?;
 
         while offset < max_offset {
             // Safe: Caller guarantees this is safe
@@ -954,3 +1051,148 @@ impl<S: Storage> std::future::AsyncDrop for FormatAccess<S> {
     }
 }
 */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::Format;
+    use crate::null::Null;
+    use crate::raw::Raw;
+
+    /// Driver that maps everything to another layer, with a configurable `writable` flag.
+    #[derive(Debug)]
+    struct IndirectDriver {
+        /// Layer to map to.
+        layer: FormatAccess<Null>,
+
+        /// `writable` flag for all mappings.
+        writable: bool,
+    }
+
+    impl Display for IndirectDriver {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            write!(f, "indirect[{}]", self.layer.inner())
+        }
+    }
+
+    #[maybe_async(?Send)]
+    impl FormatDriverInstance for IndirectDriver {
+        type Storage = Null;
+
+        fn format(&self) -> Format {
+            Format::Raw
+        }
+
+        async unsafe fn probe(_storage: &Null) -> io::Result<bool>
+        where
+            Self: Sized,
+        {
+            Ok(false)
+        }
+
+        fn size(&self) -> u64 {
+            self.layer.size()
+        }
+
+        fn collect_storage_dependencies(&self) -> Vec<&Null> {
+            self.layer.collect_storage_dependencies()
+        }
+
+        fn writable(&self) -> bool {
+            false
+        }
+
+        // Elidable in sync, but async needs a named lifetime for the boxed future bound
+        #[allow(clippy::needless_lifetimes)]
+        async fn get_mapping<'a>(
+            &'a self,
+            offset: u64,
+            max_length: u64,
+        ) -> io::Result<(ShallowMapping<'a, Null>, u64)> {
+            let remaining = self.size().saturating_sub(offset);
+            if remaining == 0 {
+                return Ok((ShallowMapping::Eof {}, 0));
+            }
+
+            Ok((
+                ShallowMapping::Indirect {
+                    layer: &self.layer,
+                    offset,
+                    writable: self.writable,
+                },
+                cmp::min(max_length, remaining),
+            ))
+        }
+
+        // Elidable in sync, but async needs a named lifetime for the boxed future bound
+        #[allow(clippy::needless_lifetimes)]
+        async fn ensure_data_mapping<'a>(
+            &'a self,
+            _offset: u64,
+            _length: u64,
+            _overwrite: bool,
+        ) -> io::Result<(&'a Null, u64, u64)> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        async fn flush(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn sync(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn resize_grow(
+            &self,
+            _new_size: u64,
+            _prealloc_mode: PreallocateMode,
+        ) -> io::Result<()> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        async fn resize_shrink(&mut self, _new_size: u64) -> io::Result<()> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+
+    /// A mapping reached through a non-writable indirect mapping must not be writable, even if a
+    /// later indirect mapping is writable.
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_indirect_mapping_writable() {
+        let raw = Raw::open_image(Null::new(1024), true).await.unwrap();
+        let middle = FormatAccess::new(IndirectDriver {
+            layer: FormatAccess::new(raw),
+            writable: true,
+        });
+
+        // Only writable hops: writable
+        let (mapping, _) = middle.get_mapping(0, 512).await.unwrap();
+        assert!(
+            matches!(mapping, Mapping::Raw { writable: true, .. }),
+            "{mapping:?}"
+        );
+
+        let top = FormatAccess::new(IndirectDriver {
+            layer: middle,
+            writable: false,
+        });
+
+        // Non-writable hop first, then a writable one: not writable
+        let (mapping, _) = top.get_mapping(0, 512).await.unwrap();
+        assert!(
+            matches!(
+                mapping,
+                Mapping::Raw {
+                    writable: false,
+                    ..
+                }
+            ),
+            "{mapping:?}"
+        );
+    }
+}

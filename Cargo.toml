@@ -15,6 +15,7 @@ maybe-async = "0.2"
 miniz_oxide = { version = "0.8", features = ["std"] }
 nix = { version = "0.30", features = ["ioctl"] }
 page_size = "0.6"
+parking_lot = "0.12"
 tokio = { version = "1", features = ["sync"], optional = true }
 tracing = { version = "0.1", features = ["attributes"] }
 vm-memory = { version = ">=0.16, <0.19", optional = true, default-features = false }
@@ -45,7 +46,7 @@ tokio = { version = "1", features = ["rt", "macros"] }
 default = ["async"]
 # async-drop = []
 async = ["dep:tokio", "dep:async-trait", "dep:futures"]
-sync = ["maybe-async/is_sync"]
+sync = ["maybe-async/is_sync", "parking_lot/arc_lock"]
 sync-wrappers = ["async", "tokio/rt"]
 vm-memory = ["dep:vm-memory"]
 

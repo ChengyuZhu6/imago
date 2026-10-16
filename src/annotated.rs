@@ -170,6 +170,10 @@ impl<T: Debug + Default + Display + Send + Sync, S: Storage> Storage for Annotat
         self.inner.sync().await
     }
 
+    async fn settle_writes(&self) -> io::Result<()> {
+        self.inner.settle_writes().await
+    }
+
     async unsafe fn invalidate_cache(&self) -> io::Result<()> {
         // Safety ensured by caller
         unsafe { self.inner.invalidate_cache() }.await

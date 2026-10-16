@@ -1,17 +1,20 @@
 //! Functionality for working with qcow2 metadata.
 
+use super::allocation::{ClustersToFreeEntry, PendingClusters};
+use super::compressed::CompressedClusterReadGuard;
 use super::types::*;
 use crate::io_buffers::IoBuffer;
 use crate::macros::numerical_enum;
 use crate::macros::on_disk_struct::{on_disk_struct, OnDiskStruct};
-use crate::misc_helpers::invalid_data;
-use crate::sync_primitives::{Mutex, MutexGuard};
+use crate::misc_helpers::{invalid_data, DropGuard};
+use crate::sync_primitives::{Mutex, MutexGuard, OwnedRwLock, OwnedRwLockWriteGuard};
 use crate::{Storage, StorageExt};
 use maybe_async::maybe_async;
 use std::collections::HashMap;
 use std::mem::size_of;
-use std::num::TryFromIntError;
+use std::num::{NonZero, TryFromIntError};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::Arc;
 use std::{cmp, io};
 use tracing::error;
 
@@ -833,7 +836,18 @@ impl Header {
     }
 
     /// Enter a new L1 table in the image header.
-    pub fn set_l1_table(&self, l1_table: &L1Table) -> io::Result<()> {
+    ///
+    /// If the L1 table’s clusters have been newly allocated, `new_allocation` must be their
+    /// pending clusters guard, which is disarmed once the table is entered.
+    pub fn set_l1_table(
+        &self,
+        l1_table: &L1Table,
+        new_allocation: Option<PendingClusters>,
+    ) -> io::Result<()> {
+        if let Some(new_allocation) = new_allocation.as_ref() {
+            debug_assert_eq!(Some(new_allocation.cluster()), l1_table.get_cluster());
+        }
+
         let offset = l1_table.get_offset().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -847,8 +861,10 @@ impl Header {
             .map_err(|err| invalid_data(format!("Too many L1 entries ({entries}): {err}")))?;
 
         self.v2.l1_table_offset.store(offset.0, Ordering::Relaxed);
-
         self.v2.l1_size.store(entries, Ordering::Relaxed);
+        if let Some(new_allocation) = new_allocation {
+            new_allocation.make_persistent();
+        }
 
         Ok(())
     }
@@ -1211,7 +1227,19 @@ impl L1Table {
     }
 
     /// Enter the given L2 table into this L1 table.
-    pub fn enter_l2_table(&mut self, index: usize, l2: &L2Table) -> io::Result<()> {
+    ///
+    /// If the L2 table’s cluster has been newly allocated, `new_allocation` must be its pending
+    /// clusters guard, which is disarmed once the table is entered.
+    pub fn enter_l2_table(
+        &mut self,
+        index: usize,
+        l2: &L2Table,
+        new_allocation: Option<PendingClusters>,
+    ) -> io::Result<()> {
+        if let Some(new_allocation) = new_allocation.as_ref() {
+            debug_assert_eq!(Some(new_allocation.cluster()), l2.get_cluster());
+        }
+
         let l2_offset = l2.get_offset().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1223,6 +1251,9 @@ impl L1Table {
         debug_assert!(l1entry.reserved_bits() == 0);
         self.data[index] = l1entry;
         self.modified.store(true, Ordering::Relaxed);
+        if let Some(new_allocation) = new_allocation {
+            new_allocation.make_persistent();
+        }
 
         Ok(())
     }
@@ -1366,7 +1397,7 @@ pub(super) enum L2Mapping {
         host_offset: HostOffset,
 
         /// Upper limit on the number of bytes that comprise the compressed data.
-        length: u64,
+        length: NonZero<u64>,
     },
 }
 
@@ -1428,15 +1459,16 @@ impl L2Entry {
 
     /// If this entry is compressed, return the start host offset and upper limit on the compressed
     /// number of bytes.
-    pub fn compressed_range(&self, cluster_bits: u32) -> Option<(HostOffset, u64)> {
+    pub fn compressed_range(&self, cluster_bits: u32) -> Option<(HostOffset, NonZero<u64>)> {
         if self.is_compressed() {
             let desc = self.compressed_descriptor();
             let compressed_offset_bits = 62 - (cluster_bits - 8);
             let offset = desc & ((1 << compressed_offset_bits) - 1) & 0x00ff_ffff_ffff_ffffu64;
-            let sectors = desc >> compressed_offset_bits;
+            let sectors: u64 = desc >> compressed_offset_bits;
             // The first sector is not considered in `sectors`, so we add it and subtract the
             // number of bytes there that do not belong to this compressed cluster
-            let length = (sectors + 1) * 512 - (offset & 511);
+            // Unwrap is safe: ∀y: 0 <= y & 511 <= 511, so ∀x >= 0: (x + 1) * 512 - (y & 511) >= 1
+            let length = NonZero::new((sectors + 1) * 512 - (offset & 511)).unwrap();
 
             Some((HostOffset(offset), length))
         } else {
@@ -1457,7 +1489,7 @@ impl L2Entry {
             // Compressed clusters can cross host cluster boundaries, and thus occupy two clusters
             let first_cluster = offset.cluster(cluster_bits);
             let cluster_count = ClusterCount::from_byte_size(
-                offset + length - first_cluster.offset(cluster_bits),
+                offset + length.get() - first_cluster.offset(cluster_bits),
                 cluster_bits,
             );
             Some((first_cluster, cluster_count))
@@ -1555,6 +1587,8 @@ impl L2Entry {
                 length,
             } => {
                 let compressed_offset_bits = 62 - (cluster_bits - 8);
+                let length = length.get();
+
                 assert!(length < 1 << cluster_bits);
                 assert!(host_offset.0 < 1 << compressed_offset_bits);
 
@@ -1711,18 +1745,32 @@ pub(super) struct L2Table {
     /// Whether this table has been modified since it was last written.
     modified: AtomicBool,
 
-    /// Lock for creating `L2TableWriteGuard`.
-    writer_lock: Mutex<()>,
+    /// Lock for creating `L2TableWriteGuard` (write) and `CompressedClusterReadGuard` (read).
+    ///
+    /// This is an owning (`Arc`-backed) lock, i.e. any access guard will have a strong reference
+    /// to it and can thus be held independently of lifetime concerns, e.g. across a data write
+    /// while a prepared mapping is not yet committed (see `Qcow2::prepare_data_mapping()`).
+    ///
+    /// Consequently, it may be held outside of qcow2 code paths, e.g. while a data write is in
+    /// flight (between preparing and committing a data mapping for it).  Thus, writing this table
+    /// to disk must work without the lock because otherwise flushing the table would deadlock
+    /// against such writes.
+    writer_lock: OwnedRwLock<()>,
+
+    /// Serializes writing this table back to disk (see [`L2Table::write_if_modified()`]).
+    writeback_lock: Mutex<()>,
 }
 
 /// Write guard for an L2 table.
+///
+/// Owns a reference to the table, so holding it also keeps the table pinned in the L2 cache.
 #[derive(Debug)]
-pub(super) struct L2TableWriteGuard<'a> {
+pub(super) struct L2TableWriteGuard {
     /// Referenced L2 table.
-    table: &'a L2Table,
+    table: Arc<L2Table>,
 
-    /// Held guard mutex on that L2 table.
-    _lock: MutexGuard<'a, ()>,
+    /// Held write guard on that L2 table.
+    lock: OwnedRwLockWriteGuard<()>,
 }
 
 #[maybe_async]
@@ -1739,6 +1787,7 @@ impl L2Table {
             external_data_file: header.external_data_file(),
             modified: true.into(),
             writer_lock: Default::default(),
+            writeback_lock: Default::default(),
         }
     }
 
@@ -1750,35 +1799,98 @@ impl L2Table {
 
     /// Allow modifying this L2 table.
     ///
-    /// Note that readers are allowed to exist while modifications are happening.
-    pub async fn lock_write(&self) -> L2TableWriteGuard<'_> {
+    /// Note that readers are allowed to exist while modifications are happening, unless they hold
+    /// a [`CompressedClusterReadGuard`].
+    ///
+    /// The returned guard keeps the table pinned in the L2 cache.
+    pub async fn lock_write(self: &Arc<Self>) -> L2TableWriteGuard {
         L2TableWriteGuard {
-            table: self,
-            _lock: self.writer_lock.lock().await,
+            table: Arc::clone(self),
+            lock: self.writer_lock.write().await,
         }
+    }
+
+    /// Lock the given compressed cluster for reading.
+    ///
+    /// Prevent modifications of this L2 table while the returned guard is held.
+    ///
+    /// Return `None` if `cluster` is not compressed (checked under the guard).
+    pub async fn lock_compressed_read(
+        &self,
+        cluster: GuestCluster,
+    ) -> io::Result<Option<CompressedClusterReadGuard<'_>>> {
+        let lock = self.writer_lock.read().await;
+        CompressedClusterReadGuard::new(self, cluster, lock.into())
+    }
+
+    /// Write this table to disk if it has been modified since it was last written.
+    ///
+    /// This is the entry point for writing back a table that is part of the L2 cache; it
+    /// serializes such write-backs against each other via `writeback_lock`.  Writing the table
+    /// clears the modified flag before copying the entries, so without that lock, two concurrent
+    /// write-backs could race such that the one with the older copy writes last, leaving that
+    /// older copy on disk while the table no longer appears modified.  Holding the lock across the
+    /// modified check means that a write-back which has to wait only writes again if something
+    /// changed after the preceding write-back’s copy.
+    ///
+    /// `cluster` is the cluster this table is expected to belong to; an `assert!()` verifies that
+    /// it really is the table’s cluster.
+    pub async fn write_if_modified<S: Storage>(
+        &self,
+        image: &S,
+        cluster: HostCluster,
+    ) -> io::Result<()> {
+        let _lock = self.writeback_lock.lock().await;
+
+        if !self.is_modified() {
+            return Ok(());
+        }
+
+        assert!(self.get_cluster().unwrap() == cluster);
+        self.write(image).await
     }
 }
 
-impl L2TableWriteGuard<'_> {
+impl L2TableWriteGuard {
     /// Look up a cluster mapping.
     pub fn get_mapping(&self, lookup_cluster: GuestCluster) -> io::Result<L2Mapping> {
         self.table.get_mapping(lookup_cluster)
     }
 
+    /// Get a read guard for the given compressed cluster.
+    ///
+    /// The returned guard borrows this write guard, so the table cannot be modified while it is
+    /// held.
+    ///
+    /// Return `None` if `cluster` is not compressed (checked under the guard).
+    pub fn compressed_read_guard(
+        &self,
+        cluster: GuestCluster,
+    ) -> io::Result<Option<CompressedClusterReadGuard<'_>>> {
+        CompressedClusterReadGuard::new(&self.table, cluster, (&self.lock).into())
+    }
+
     /// Enter the given raw data cluster mapping into the L2 table.
     ///
     /// If the previous entry pointed to an allocated cluster, return the old allocation so its
-    /// refcount can be decreased (offset of the first cluster and number of clusters -- compressed
-    /// clusters can span across host cluster boundaries).
+    /// refcount can be decreased.
     ///
     /// If the allocation is reused, `None` is returned, so this function only returns `Some(_)` if
     /// some cluster is indeed leaked.
+    ///
+    /// If `host_cluster` has been newly allocated, `new_allocation` must be its pending clusters
+    /// guard, which is disarmed once the mapping is in place.
     #[must_use = "Leaked allocation must be freed"]
     pub fn map_cluster(
         &mut self,
         index: usize,
         host_cluster: HostCluster,
-    ) -> Option<(HostCluster, ClusterCount)> {
+        new_allocation: Option<PendingClusters>,
+    ) -> Option<ClustersToFreeEntry> {
+        if let Some(new_allocation) = new_allocation.as_ref() {
+            debug_assert_eq!(new_allocation.cluster(), host_cluster);
+        }
+
         let new = L2Entry::from_mapping(
             L2Mapping::DataFile {
                 host_cluster,
@@ -1790,13 +1902,16 @@ impl L2TableWriteGuard<'_> {
         // `L2TableWriteGuard`).
         let l2e = unsafe { self.table.data[index].swap(new) };
         self.table.modified.store(true, Ordering::Relaxed);
+        if let Some(new_allocation) = new_allocation {
+            new_allocation.make_persistent();
+        }
 
         let allocation = l2e.allocation(self.table.cluster_bits, self.table.external_data_file);
         if let Some((a_cluster, a_count)) = allocation {
             if a_cluster == host_cluster && a_count == ClusterCount(1) {
                 None
             } else {
-                allocation
+                Some(ClustersToFreeEntry::data(a_cluster, a_count))
             }
         } else {
             None
@@ -1810,14 +1925,13 @@ impl L2TableWriteGuard<'_> {
     /// Otherwise, the existing mapping is discarded.
     ///
     /// If a previous mapping is discarded, return the old allocation so its refcount can be
-    /// decreased (offset of the first cluster and number of clusters -- compressed clusters can
-    /// span across host cluster boundaries).
+    /// decreased.
     #[must_use = "Leaked allocation must be freed"]
     pub fn zero_cluster(
         &mut self,
         index: usize,
         keep_allocation: bool,
-    ) -> io::Result<Option<(HostCluster, ClusterCount)>> {
+    ) -> io::Result<Option<ClustersToFreeEntry>> {
         let cluster_copied = if keep_allocation {
             match self.table.data[index].get().into_mapping(
                 GuestCluster(0), // only used for backing, which we ignore
@@ -1867,6 +1981,7 @@ impl L2TableWriteGuard<'_> {
 
         let leaked = if !retained {
             old.allocation(self.table.cluster_bits, self.table.external_data_file)
+                .map(|(first_cluster, count)| ClustersToFreeEntry::data(first_cluster, count))
         } else {
             None
         };
@@ -1876,10 +1991,9 @@ impl L2TableWriteGuard<'_> {
     /// Remove the given mapping, leaving it empty.
     ///
     /// If a previous mapping is discarded, return the old allocation so its refcount can be
-    /// decreased (offset of the first cluster and number of clusters -- compressed clusters can
-    /// span across host cluster boundaries).
+    /// decreased.
     #[must_use = "Leaked allocation must be freed"]
-    pub fn discard_cluster(&mut self, index: usize) -> Option<(HostCluster, ClusterCount)> {
+    pub fn discard_cluster(&mut self, index: usize) -> Option<ClustersToFreeEntry> {
         let new = L2Entry(0);
 
         // Safe: We set a full valid mapping, and there is only one writer (thanks to
@@ -1888,6 +2002,7 @@ impl L2TableWriteGuard<'_> {
         self.table.modified.store(true, Ordering::Relaxed);
 
         old.allocation(self.table.cluster_bits, self.table.external_data_file)
+            .map(|(first_cluster, count)| ClustersToFreeEntry::data(first_cluster, count))
     }
 }
 
@@ -1907,6 +2022,7 @@ impl Table for L2Table {
             external_data_file: header.external_data_file(),
             modified: true.into(),
             writer_lock: Default::default(),
+            writeback_lock: Default::default(),
         }
     }
 
@@ -1977,6 +2093,7 @@ impl Clone for L2Table {
             external_data_file: self.external_data_file,
             modified,
             writer_lock: Default::default(),
+            writeback_lock: Default::default(),
         }
     }
 }
@@ -2104,7 +2221,19 @@ impl RefTable {
     }
 
     /// Enter the given refcount block into this refcount table.
-    pub fn enter_refblock(&mut self, index: usize, rb: &RefBlock) -> io::Result<()> {
+    ///
+    /// If the refblock’s cluster has been newly allocated, `new_allocation` must be its pending
+    /// clusters guard, which is disarmed once the refblock is entered.
+    pub fn enter_refblock(
+        &mut self,
+        index: usize,
+        rb: &RefBlock,
+        new_allocation: Option<PendingClusters>,
+    ) -> io::Result<()> {
+        if let Some(new_allocation) = new_allocation.as_ref() {
+            debug_assert_eq!(Some(new_allocation.cluster()), rb.get_cluster());
+        }
+
         let rb_offset = rb.get_offset().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2116,6 +2245,9 @@ impl RefTable {
         debug_assert!(rt_entry.reserved_bits() == 0);
         self.data[index] = rt_entry;
         self.modified.store(true, Ordering::Relaxed);
+        if let Some(new_allocation) = new_allocation {
+            new_allocation.make_persistent();
+        }
 
         Ok(())
     }
@@ -2208,6 +2340,9 @@ pub(super) struct RefBlock {
 
     /// Lock for creating `RefBlockWriteGuard`.
     writer_lock: Mutex<()>,
+
+    /// Serializes writing this block back to disk (see [`RefBlock::write_if_modified()`]).
+    writeback_lock: Mutex<()>,
 }
 
 /// Write guard for a refblock.
@@ -2233,6 +2368,7 @@ impl RefBlock {
             cluster_bits: header.cluster_bits(),
             modified: true.into(),
             writer_lock: Default::default(),
+            writeback_lock: Default::default(),
         })
     }
 
@@ -2267,6 +2403,7 @@ impl RefBlock {
             cluster_bits,
             modified: false.into(),
             writer_lock: Default::default(),
+            writeback_lock: Default::default(),
         })
     }
 
@@ -2303,6 +2440,8 @@ impl RefBlock {
             .ok_or_else(|| io::Error::other("Cannot write qcow2 refcount block, no offset set"))?;
 
         self.clear_modified();
+        // Re-set the modified flag if we don’t get to execute the write
+        let mut modified_guard = DropGuard::new(|| self.set_modified());
 
         let buffer = match self.refcount_order {
             // refcount_bits == 1, 2, 4, 8
@@ -2332,10 +2471,9 @@ impl RefBlock {
             _ => unreachable!(),
         };
 
-        if let Err(err) = image.write(&buffer, offset.0).await {
-            self.set_modified();
-            return Err(err);
-        }
+        image.write(&buffer, offset.0).await?;
+        // Write executed, disarm guard, flag can remaing cleared
+        modified_guard.disarm();
 
         Ok(())
     }
@@ -2439,6 +2577,33 @@ impl RefBlock {
             rb: self,
             _lock: self.writer_lock.lock().await,
         }
+    }
+
+    /// Write this block to disk if it has been modified since it was last written.
+    ///
+    /// This is the entry point for writing back a block that is part of the refblock cache; it
+    /// serializes such write-backs against each other via `writeback_lock`.  Writing the block
+    /// clears the modified flag before copying the data, so without that lock, two concurrent
+    /// write-backs could race such that the one with the older copy writes last, leaving that
+    /// older copy on disk while the block no longer appears modified.  Holding the lock across the
+    /// modified check means that a write-back which has to wait only writes again if something
+    /// changed after the preceding write-back’s copy.
+    ///
+    /// `cluster` is the cluster this block is expected to belong to; an `assert!()` verifies that
+    /// it really is the block’s cluster.
+    pub async fn write_if_modified<S: Storage>(
+        &self,
+        image: &S,
+        cluster: HostCluster,
+    ) -> io::Result<()> {
+        let _lock = self.writeback_lock.lock().await;
+
+        if !self.is_modified() {
+            return Ok(());
+        }
+
+        assert!(self.get_cluster().unwrap() == cluster);
+        self.write(image).await
     }
 
     /// Check whether this block has been modified since it was last written.
@@ -2796,6 +2961,8 @@ pub trait Table: Sized {
         let mut buffer = IoBuffer::new(byte_size, cmp::max(image.mem_align(), size_of::<u64>()))?;
 
         self.clear_modified();
+        // Re-set the modified flag if we don’t get to execute the write
+        let mut modified_guard = DropGuard::new(|| self.set_modified());
 
         // Safe because we have just allocated this, and it fits the alignment
         let raw_table = unsafe { buffer.as_mut().into_typed_slice::<u64>() };
@@ -2804,10 +2971,9 @@ pub trait Table: Sized {
             *be_value = self.get_ref(i).map(|e| e.to_plain()).unwrap_or(0).to_be();
         }
 
-        if let Err(err) = image.write(&buffer, offset.0).await {
-            self.set_modified();
-            return Err(err);
-        }
+        image.write(&buffer, offset.0).await?;
+        // Write executed, disarm guard, flag can remaing cleared
+        modified_guard.disarm();
 
         Ok(())
     }
@@ -2816,19 +2982,24 @@ pub trait Table: Sized {
     ///
     /// Potentially writes more of the table, if alignment requirements ask for that.
     async fn write_entry<S: Storage>(&self, image: &S, index: usize) -> io::Result<()> {
-        // This alignment calculation code implicitly assumes that the cluster size is aligned to
-        // the storage’s request/memory alignment, but that is often fair.  If that is not the
-        // case, there is not much we can do anyway.
-        let byte_size = self.byte_size();
-        let power_of_two_up_to_byte_size = ((byte_size / 2) + 1).next_power_of_two();
-        let alignment = cmp::min(
-            power_of_two_up_to_byte_size,
-            cmp::max(
-                cmp::max(image.mem_align(), image.req_align()),
-                size_of::<u64>(),
-            ),
-        );
-        let alignment_in_entries = alignment / size_of::<u64>();
+        // If the storage alignment does not exceed the cluster size, we can prevent a generic
+        // storage-layer RMW by making an aligned write of the fully aligned portion of the table
+        // that includes the requested index.
+        // Otherwise, it would be unsafe because the tail of the table may not be a full alignment
+        // block (so we cannot access it this way), and it would also be rather useless because we
+        // do not even know if the table’s first cluster is aligned anyway. So fall back to
+        // storage-layer RMW then.
+        let alignment = image
+            .mem_align()
+            .max(image.req_align())
+            .max(size_of::<u64>());
+        let cluster_size = 1 << self.cluster_bits();
+        let alignment = if alignment <= cluster_size {
+            alignment
+        } else {
+            size_of::<u64>()
+        };
+        let entries_to_write = alignment / size_of::<u64>();
 
         let offset = self
             .get_offset()
@@ -2840,16 +3011,16 @@ pub trait Table: Sized {
             self.entries(),
             size_of::<u64>(),
             Self::MAX_ENTRIES,
-            1 << self.cluster_bits(),
+            cluster_size,
         )?;
 
         let mut buffer = IoBuffer::new(alignment, cmp::max(image.mem_align(), size_of::<u64>()))?;
 
         // Safe because we have just allocated this, and it fits the alignment
         let raw_entries = unsafe { buffer.as_mut().into_typed_slice::<u64>() };
-        let first_index = (index / alignment_in_entries) * alignment_in_entries;
+        let first_index = (index / entries_to_write) * entries_to_write;
         #[allow(clippy::needless_range_loop)]
-        for i in 0..alignment_in_entries {
+        for i in 0..entries_to_write {
             // 0 always works, that’s by design.
             raw_entries[i] = self
                 .get_ref(first_index + i)
@@ -2911,4 +3082,75 @@ fn encode_binary<T: OnDiskStruct>(val: &T) -> io::Result<Vec<u8>> {
 /// Decode `T` from the given byte buffer.
 fn decode_binary<T: OnDiskStruct>(slice: &[u8]) -> io::Result<T> {
     T::load_from(slice)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test::mem_storage::{MemStorage, MemStorageState};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    /// Regression test: If the metadata file has alignment requirements larger than the cluster
+    /// size, then `write_entry()` must not try to up-align the request to that, because having the
+    /// request span multiple clusters is a very bad idea then, as this might overwrite clusters
+    /// adjacent to the table.
+    /// This test is such a case:
+    /// - Alignment is 4096
+    /// - Cluster size is 512
+    /// - The L1 table spans 5 clusters (from cluster 8 == 4096B onwards), that is, 2560B
+    ///
+    /// The old `write_entry()` tried to be clever and reduce the alignment it used such that it
+    /// would not exceed the table length, i.e. 2048B in this case, but that is (a) very unhelpful
+    /// because 2048 is just less than 4096, so does not help at all, and (b) will still be wrong
+    /// for the unaligned tail of the L1 table.
+    ///
+    /// So this test verifies that writing into that tail (cluster 4 of the L1 table) will not
+    /// overwrite anything past the L1 table.
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn l1_write_entry_beyond_table_end() {
+        let uninitialized: u8 = 0xa5;
+
+        let header = Header::new(9, 4, None, None, None);
+        let state = Arc::new(MemStorageState {
+            data: Mutex::new(vec![uninitialized; 16384]),
+            ..Default::default()
+        });
+        let mem = MemStorage::new(Arc::clone(&state), true).with_align(4096);
+
+        let l1_cluster_start = 8;
+        let l1_offset = l1_cluster_start * 512;
+        let l1_entries = 320;
+        let l1_byte_size = l1_entries * size_of::<u64>();
+
+        // Index 300 is at offset 2400, i.e. well into cluster 4 (which begins at index 256)
+        let test_index = 300;
+        let test_entry = (1 << 63) | 0x10000;
+
+        let mut data = vec![L1Entry::default(); l1_entries];
+        data[test_index] = L1Entry::try_from_plain(test_entry, &header).unwrap();
+        let mut l1 = L1Table::from_data(data.into_boxed_slice(), &header);
+        l1.set_cluster(HostCluster(l1_cluster_start as u64));
+
+        l1.write_entry(&mem, test_index).await.unwrap();
+
+        // Verify the entry was written
+        let data = state.data.lock();
+        let offset = l1_offset + test_index * size_of::<u64>();
+        let entry = u64::from_be_bytes(
+            data[offset..(offset + size_of::<u64>())]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(entry, test_entry);
+
+        // Verify nothing past the L1 table was clobbered
+        let offset_past = l1_offset + l1_byte_size;
+        let next_alignment_boundary = offset_past.next_multiple_of(4096);
+        let clobbered = data[offset_past..next_alignment_boundary]
+            .iter()
+            .filter(|b| **b != uninitialized)
+            .count();
+        assert_eq!(clobbered, 0, "bytes after the L1 table were overwritten");
+    }
 }
