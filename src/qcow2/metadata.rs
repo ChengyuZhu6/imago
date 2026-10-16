@@ -6,7 +6,7 @@ use super::types::*;
 use crate::io_buffers::IoBuffer;
 use crate::macros::numerical_enum;
 use crate::macros::on_disk_struct::{on_disk_struct, OnDiskStruct};
-use crate::misc_helpers::invalid_data;
+use crate::misc_helpers::{invalid_data, DropGuard};
 use crate::sync_primitives::{Mutex, MutexGuard, OwnedRwLock, OwnedRwLockWriteGuard};
 use crate::{Storage, StorageExt};
 use maybe_async::maybe_async;
@@ -2402,6 +2402,8 @@ impl RefBlock {
             .ok_or_else(|| io::Error::other("Cannot write qcow2 refcount block, no offset set"))?;
 
         self.clear_modified();
+        // Re-set the modified flag if we don’t get to execute the write
+        let mut modified_guard = DropGuard::new(|| self.set_modified());
 
         let buffer = match self.refcount_order {
             // refcount_bits == 1, 2, 4, 8
@@ -2431,10 +2433,9 @@ impl RefBlock {
             _ => unreachable!(),
         };
 
-        if let Err(err) = image.write(&buffer, offset.0).await {
-            self.set_modified();
-            return Err(err);
-        }
+        image.write(&buffer, offset.0).await?;
+        // Write executed, disarm guard, flag can remaing cleared
+        modified_guard.disarm();
 
         Ok(())
     }
@@ -2895,6 +2896,8 @@ pub trait Table: Sized {
         let mut buffer = IoBuffer::new(byte_size, cmp::max(image.mem_align(), size_of::<u64>()))?;
 
         self.clear_modified();
+        // Re-set the modified flag if we don’t get to execute the write
+        let mut modified_guard = DropGuard::new(|| self.set_modified());
 
         // Safe because we have just allocated this, and it fits the alignment
         let raw_table = unsafe { buffer.as_mut().into_typed_slice::<u64>() };
@@ -2903,10 +2906,9 @@ pub trait Table: Sized {
             *be_value = self.get_ref(i).map(|e| e.to_plain()).unwrap_or(0).to_be();
         }
 
-        if let Err(err) = image.write(&buffer, offset.0).await {
-            self.set_modified();
-            return Err(err);
-        }
+        image.write(&buffer, offset.0).await?;
+        // Write executed, disarm guard, flag can remaing cleared
+        modified_guard.disarm();
 
         Ok(())
     }
