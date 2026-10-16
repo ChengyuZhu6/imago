@@ -689,4 +689,54 @@ mod tests {
         let len = cache.0.map.read().await.len();
         assert_eq!(len, 1);
     }
+
+    /// When the future evicting an entry is dropped while flushing it, the entry must remain in
+    /// the cache (otherwise, its modifications would be lost)
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn test_dropped_eviction_flush_keeps_entry() {
+        use futures::FutureExt;
+
+        /// Backend whose flushes never complete, and that counts loads
+        #[derive(Default)]
+        struct PendingFlushBackend {
+            loads: AtomicUsize,
+        }
+
+        #[maybe_async(AFIT)]
+        impl AsyncLruCacheBackend for PendingFlushBackend {
+            type Key = usize;
+            type Value = usize;
+
+            async fn load(&self, key: usize) -> io::Result<usize> {
+                self.loads.fetch_add(1, Ordering::Relaxed);
+                Ok(key)
+            }
+
+            async fn flush(&self, _key: usize, _value: &usize) -> io::Result<()> {
+                std::future::pending().await
+            }
+
+            unsafe fn evict(&self, _key: usize, _value: usize) {}
+        }
+
+        let backend = Arc::new(PendingFlushBackend::default());
+        let cache = AsyncLruCache::new(Arc::clone(&backend), 2);
+
+        cache.get_or_insert(0, false).await.unwrap().unwrap();
+        cache.get_or_insert(1, false).await.unwrap().unwrap();
+        assert_eq!(backend.loads.load(Ordering::Relaxed), 2);
+
+        // Evicting the oldest entry (key 0) stays pending on its flush; drop it then
+        assert!(cache.get_or_insert(2, true).now_or_never().is_none());
+
+        // Check that both keys still exist, i.e. must not need to be loaded again
+        let entry = cache.get_or_insert(0, false).await.unwrap().unwrap();
+        assert_eq!(*entry, 0);
+        let entry = cache.get_or_insert(1, false).await.unwrap().unwrap();
+        assert_eq!(*entry, 1);
+
+        // And that the number of loads did not change
+        assert_eq!(backend.loads.load(Ordering::Relaxed), 2);
+    }
 }
