@@ -503,4 +503,21 @@ mod tests {
         let result = mem.write(&buf[..50], offset).await;
         assert!(result.is_err());
     }
+
+    /// Discard and write-zeroes requests whose start, aligned up, is beyond `u64::MAX` must return
+    /// an error.
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn discard_write_zeroes_overflow() {
+        // Discard and zero alignment default to the request alignment
+        let mem = MemStorage::new(Arc::new(MemStorageState::default()), false).with_align(4096);
+
+        // End does not overflow, but the start aligned up does
+        let offset = u64::MAX - 10;
+        let result = mem.discard(offset, 5).await;
+        assert!(result.is_err());
+        let result = mem.write_zeroes(offset, 5).await;
+        assert!(result.is_err());
+        let result = mem.write_allocated_zeroes(offset, 5).await;
+        assert!(result.is_err());
+    }
 }
