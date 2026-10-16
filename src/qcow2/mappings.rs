@@ -769,4 +769,111 @@ mod tests {
             );
         }
     }
+
+    /// Read a big-endian 64-bit value from the storage.
+    #[cfg(feature = "async")]
+    fn read_u64(state: &MemStorageState, offset: u64) -> u64 {
+        let data = state.data.lock();
+        let offset = offset as usize;
+        u64::from_be_bytes(data[offset..offset + 8].try_into().unwrap())
+    }
+
+    /// If a flush is dropped before it has written back a modified L2 table, the table must still
+    /// be considered modified, so that a later flush writes it.
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn test_dropped_l2_writeback_keeps_table_modified() {
+        use crate::StorageExt;
+        use futures::FutureExt;
+
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = create_image(&state, 64 * 1024, 16).await;
+        let cb = qcow2.header.cluster_bits();
+
+        // Map guest cluster 0 (so the L2 table exists), and write everything
+        let mapping = qcow2.prepare_data_mapping(0, 512, true).await.unwrap();
+        qcow2.commit_data_mapping(mapping).await.unwrap();
+        qcow2.flush().await.unwrap();
+
+        // Modify the L2 table: Map guest cluster 1
+        let mapping = qcow2.prepare_data_mapping(512, 512, true).await.unwrap();
+        let host_offset = mapping.offset();
+        qcow2.commit_data_mapping(mapping).await.unwrap();
+
+        let l2_offset = {
+            let l1 = qcow2.l1_table.read().await;
+            l1.get(GuestOffset(0).l1_index(cb)).l2_offset().unwrap().0
+        };
+
+        // Flush, but have writing the L2 table wait for a concurrent request blocking its range,
+        // and drop the flush while it waits
+        let blocker = qcow2
+            .metadata
+            .strong_write_blocker(l2_offset..(l2_offset + 512))
+            .await;
+        assert!(qcow2.flush().now_or_never().is_none());
+        drop(blocker);
+
+        // A later flush must write the L2 table
+        qcow2.flush().await.unwrap();
+        let entry = read_u64(&state, l2_offset + 8);
+        assert_eq!(
+            entry & 0x00ff_ffff_ffff_fe00,
+            host_offset,
+            "mapping guest cluster 1 lost on disk (L2 entry {entry:#x})"
+        );
+    }
+
+    /// If a flush is dropped before it has written back a modified refblock, the refblock must
+    /// still be considered modified, so that a later flush writes it.
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn test_dropped_refblock_writeback_keeps_block_modified() {
+        use crate::StorageExt;
+        use futures::FutureExt;
+
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = create_image(&state, 64 * 1024, 16).await;
+        let cb = qcow2.header.cluster_bits();
+        let rb_bits = qcow2.header.rb_bits();
+        let refcount_bytes = 2; // 16-bit refcounts
+
+        // Map guest cluster 0 (so the L2 table exists), and write everything
+        let mapping = qcow2.prepare_data_mapping(0, 512, true).await.unwrap();
+        qcow2.commit_data_mapping(mapping).await.unwrap();
+        qcow2.flush().await.unwrap();
+
+        // Modify the refblock: Allocate a data cluster for guest cluster 1
+        let mapping = qcow2.prepare_data_mapping(512, 512, true).await.unwrap();
+        let host_offset = mapping.offset();
+        qcow2.commit_data_mapping(mapping).await.unwrap();
+        let host_cluster = HostOffset(host_offset).cluster(cb);
+        assert_eq!(host_cluster.rt_index(rb_bits), 0);
+
+        let rb_offset = read_u64(&state, qcow2.header.reftable_offset().0) & !511;
+
+        // Flush, but have writing the refblock wait for a concurrent request blocking its range,
+        // and drop the flush while it waits
+        let blocker = qcow2
+            .metadata
+            .strong_write_blocker(rb_offset..(rb_offset + 512))
+            .await;
+        assert!(qcow2.flush().now_or_never().is_none());
+        drop(blocker);
+
+        // A later flush must write the refblock
+        qcow2.flush().await.unwrap();
+        let refcount_offset =
+            (rb_offset + (host_cluster.rb_index(rb_bits) * refcount_bytes) as u64) as usize;
+        let data = state.data.lock();
+        let refcount = u16::from_be_bytes(
+            data[refcount_offset..refcount_offset + refcount_bytes]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(
+            refcount, 1,
+            "refcount increment for {host_cluster:?} lost on disk"
+        );
+    }
 }
