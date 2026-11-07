@@ -27,6 +27,12 @@ pub trait StorageExt: Storage {
     #[allow(async_fn_in_trait)] // No need for Send
     async fn readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()>;
 
+    /// Read with alignment handling and EOF zero-fill, returning the actual prefix if known.
+    ///
+    /// Alignment padding is excluded from the count; `None` means the backend cannot count.
+    #[allow(async_fn_in_trait)]
+    async fn readv_counted(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<Option<u64>>;
+
     /// Write data from `bufv` to `offset`.
     ///
     /// Writes all data from `bufv`, i.e. will not do short writes.  When reaching the end of file,
@@ -96,65 +102,12 @@ pub trait StorageExt: Storage {
 
 #[maybe_async(AFIT)]
 impl<S: Storage> StorageExt for S {
-    async fn readv(&self, mut bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
-        if bufv.is_empty() {
-            return Ok(());
-        }
+    async fn readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
+        readv_impl(self, bufv, offset, false).await.map(|_| ())
+    }
 
-        let unpadded_end = offset
-            .checked_add(bufv.len())
-            .ok_or_else(|| io::Error::other("Read wrap-around"))?;
-
-        let mem_align = self.mem_align();
-        let req_align = self.req_align();
-
-        if is_aligned(&bufv, offset, mem_align, req_align) {
-            // Safe: Alignment checked
-            return unsafe { self.pure_readv(bufv, offset) }.await;
-        }
-
-        trace!(
-            "Unaligned read: 0x{offset:x} + {} (size: {:#x})",
-            bufv.len(),
-            self.size().unwrap()
-        );
-
-        let req_align_mask = req_align as u64 - 1;
-        // Length must be aligned to both memory and request alignments
-        let len_align_mask = req_align_mask | (mem_align as u64 - 1);
-        debug_assert!((len_align_mask + 1).is_multiple_of(req_align as u64));
-
-        let padded_offset = offset & !req_align_mask;
-        // This will over-align at the end of file (aligning to exactly the end of file would be
-        // sufficient), but it is easier this way.
-        let padded_end = unpadded_end
-            .checked_add(req_align_mask)
-            .ok_or_else(|| io::Error::other("Read wrap-around"))?
-            & !req_align_mask;
-        // Now also align to memory alignment
-        let padded_len = (padded_end - padded_offset + len_align_mask) & !(len_align_mask);
-        let padded_end = padded_offset
-            .checked_add(padded_len)
-            .ok_or_else(|| io::Error::other("Read wrap-around"))?;
-
-        let padded_len: usize = (padded_end - padded_offset)
-            .try_into()
-            .map_err(|e| io::Error::other(format!("Cannot realign read: {e}")))?;
-
-        trace!("Padded read: {padded_offset:#x} + {padded_len}");
-
-        let mut bounce_buf = IoBuffer::new(padded_len, mem_align)?;
-
-        // Safe: Alignment enforced
-        unsafe { self.pure_readv(bounce_buf.as_mut().into(), padded_offset) }.await?;
-
-        let in_buf_ofs = (offset - padded_offset) as usize;
-        // Must fit in `usize` because `padded_len: usize`
-        let in_buf_end = (unpadded_end - padded_offset) as usize;
-
-        bufv.copy_from_slice(bounce_buf.as_ref_range(in_buf_ofs..in_buf_end).into_slice());
-
-        Ok(())
+    async fn readv_counted(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<Option<u64>> {
+        readv_impl(self, bufv, offset, true).await
     }
 
     async fn writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
@@ -317,6 +270,82 @@ impl<S: Storage> StorageExt for S {
     }
 }
 
+/// Share request alignment handling between legacy and counted reads.
+#[maybe_async]
+async fn readv_impl<S: Storage>(
+    storage: &S,
+    mut bufv: IoVectorMut<'_>,
+    offset: u64,
+    counted: bool,
+) -> io::Result<Option<u64>> {
+    if bufv.is_empty() {
+        return Ok(Some(0));
+    }
+
+    let request_len = bufv.len();
+    let unpadded_end = offset
+        .checked_add(request_len)
+        .ok_or_else(|| io::Error::other("Read wrap-around"))?;
+
+    let mem_align = storage.mem_align();
+    let req_align = storage.req_align();
+
+    if is_aligned(&bufv, offset, mem_align, req_align) {
+        return if counted {
+            unsafe { storage.pure_readv_counted(bufv, offset) }.await
+        } else {
+            unsafe { storage.pure_readv(bufv, offset) }.await?;
+            Ok(None)
+        };
+    }
+
+    trace!(
+        "Unaligned read: 0x{offset:x} + {} (size: {:#x})",
+        bufv.len(),
+        storage.size().unwrap()
+    );
+
+    let req_align_mask = req_align as u64 - 1;
+    // Length must be aligned to both memory and request alignments
+    let len_align_mask = req_align_mask | (mem_align as u64 - 1);
+    debug_assert!((len_align_mask + 1).is_multiple_of(req_align as u64));
+
+    let padded_offset = offset & !req_align_mask;
+    // This will over-align at the end of file (aligning to exactly the end of file would be
+    // sufficient), but it is easier this way.
+    let padded_end = unpadded_end
+        .checked_add(req_align_mask)
+        .ok_or_else(|| io::Error::other("Read wrap-around"))?
+        & !req_align_mask;
+    // Now also align to memory alignment
+    let padded_len = (padded_end - padded_offset + len_align_mask) & !(len_align_mask);
+    let padded_end = padded_offset
+        .checked_add(padded_len)
+        .ok_or_else(|| io::Error::other("Read wrap-around"))?;
+
+    let padded_len: usize = (padded_end - padded_offset)
+        .try_into()
+        .map_err(|e| io::Error::other(format!("Cannot realign read: {e}")))?;
+
+    trace!("Padded read: {padded_offset:#x} + {padded_len}");
+
+    let mut bounce_buf = IoBuffer::new(padded_len, mem_align)?;
+    let actual_len = if counted {
+        unsafe { storage.pure_readv_counted(bounce_buf.as_mut().into(), padded_offset) }.await?
+    } else {
+        unsafe { storage.pure_readv(bounce_buf.as_mut().into(), padded_offset) }.await?;
+        None
+    };
+
+    let in_buf_ofs = (offset - padded_offset) as usize;
+    // Must fit in `usize` because `padded_len: usize`
+    let in_buf_end = (unpadded_end - padded_offset) as usize;
+
+    bufv.copy_from_slice(bounce_buf.as_ref_range(in_buf_ofs..in_buf_end).into_slice());
+
+    Ok(actual_len.map(|len| len.saturating_sub(in_buf_ofs as u64).min(request_len)))
+}
+
 /// Check whether the given request is aligned.
 fn is_aligned<V: IoVectorTrait>(bufv: &V, offset: u64, mem_align: usize, req_align: usize) -> bool {
     debug_assert!(mem_align.is_power_of_two() && req_align.is_power_of_two());
@@ -471,6 +500,27 @@ mod tests {
     use super::*;
     use crate::test::mem_storage::{MemStorage, MemStorageState};
     use std::sync::Arc;
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn readv_counted_legacy_backend_returns_unknown() {
+        let storage = crate::null::Null::new(4);
+        let mut buf = [0xff; 8];
+        let count = storage
+            .readv_counted((&mut buf[..]).into(), 0)
+            .await
+            .unwrap();
+        assert_eq!(count, None);
+        assert_eq!(buf, [0; 8]);
+
+        let storage: Box<dyn crate::storage::DynStorage> = Box::new(storage);
+        buf.fill(0xff);
+        let count = storage
+            .readv_counted((&mut buf[..]).into(), 0)
+            .await
+            .unwrap();
+        assert_eq!(count, None);
+        assert_eq!(buf, [0; 8]);
+    }
 
     /// Requests whose end, or padded end, is beyond `u64::MAX` must return an error.
     #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]

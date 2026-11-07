@@ -38,20 +38,22 @@ impl<S: Storage> AsyncLruCacheBackend for L2CacheBackend<S> {
 
     async fn load(&self, l2_cluster: HostCluster) -> io::Result<L2Table> {
         trace!("Loading L2 table");
-
-        L2Table::load(
+        self.header.ensure_healthy()?;
+        let table = L2Table::load(
             self.file.as_ref(),
             &self.header,
             l2_cluster,
             self.header.l2_entries(),
         )
-        .await
+        .await?;
+        self.header.ensure_healthy()?;
+        Ok(table)
     }
 
     async fn flush(&self, l2_cluster: HostCluster, l2_table: &L2Table) -> io::Result<()> {
         trace!("Flushing L2 table");
         l2_table
-            .write_if_modified(self.file.as_ref(), l2_cluster)
+            .write_if_modified(self.file.as_ref(), &self.header, l2_cluster)
             .await
     }
 
@@ -79,12 +81,15 @@ impl<S: Storage> AsyncLruCacheBackend for RefBlockCacheBackend<S> {
     type Value = RefBlock;
 
     async fn load(&self, rb_cluster: HostCluster) -> io::Result<RefBlock> {
-        RefBlock::load(self.file.as_ref(), &self.header, rb_cluster).await
+        self.header.ensure_healthy()?;
+        let block = RefBlock::load(self.file.as_ref(), &self.header, rb_cluster).await?;
+        self.header.ensure_healthy()?;
+        Ok(block)
     }
 
     async fn flush(&self, rb_cluster: HostCluster, refblock: &RefBlock) -> io::Result<()> {
         refblock
-            .write_if_modified(self.file.as_ref(), rb_cluster)
+            .write_if_modified(self.file.as_ref(), &self.header, rb_cluster)
             .await
     }
 
@@ -109,11 +114,11 @@ enum CacheDependency {
 ///
 /// When allocating clusters, we need to increment the refcounts (from 0 to 1) before writing the
 /// L2 pointers.  Therefore, before anything is written from the L2 cache to disk, we need to flush
-/// the refblock cache.
+/// the refblock cache and make those writes durable in the backing storage.
 ///
 /// When freeing clusters, we need to clear the L2 pointers before decrementing the refcounts (to
 /// 0).  Therefore before anything is written from the refblock cache to disk, we need to flush the
-/// L2 cache.
+/// L2 cache and make those writes durable in the backing storage.
 ///
 /// This structure takes care to heed those dependencies (though the general qcow2 code still needs
 /// to announce them by calling `.l2_depends_on_rb()` for allocations and `.rb_depends_on_l2()` for
@@ -132,6 +137,9 @@ enum CacheDependency {
 /// [`L2Table::write_if_modified()`]); that is a leaf, held only across the write itself and never
 /// across anything that acquires `direction`.
 pub(super) struct MetadataCaches<S: Storage> {
+    /// Backing storage for durability barriers between dependent metadata writes.
+    file: Arc<S>,
+
     /// L2 table cache
     l2: AsyncLruCache<HostCluster, L2Table, L2CacheBackend<S>>,
 
@@ -157,6 +165,7 @@ impl<S: Storage> MetadataCaches<S> {
         let rb_backend = RefBlockCacheBackend::new(Arc::clone(file), Arc::clone(header));
 
         MetadataCaches {
+            file: Arc::clone(file),
             l2: AsyncLruCache::new(l2_backend, l2_entries),
             rb: AsyncLruCache::new(rb_backend, rb_entries),
             direction: Default::default(),
@@ -173,6 +182,8 @@ impl<S: Storage> MetadataCaches<S> {
         }
         if *dir == CacheDependency::RbDependsOnL2 {
             self.l2.flush().await?;
+            self.file.flush().await?;
+            self.file.sync().await?;
         }
         *dir = CacheDependency::L2DependsOnRb;
         Ok(())
@@ -188,9 +199,24 @@ impl<S: Storage> MetadataCaches<S> {
         }
         if *dir == CacheDependency::L2DependsOnRb {
             self.rb.flush().await?;
+            self.file.flush().await?;
+            self.file.sync().await?;
         }
         *dir = CacheDependency::RbDependsOnL2;
         Ok(())
+    }
+
+    /// Persist removed mappings before reclaiming their underlying data.
+    pub async fn flush_l2(&self) -> io::Result<()> {
+        let direction = self.direction.read().await;
+        if *direction == CacheDependency::L2DependsOnRb {
+            self.rb.flush().await?;
+            self.file.flush().await?;
+            self.file.sync().await?;
+        }
+        self.l2.flush().await?;
+        self.file.flush().await?;
+        self.file.sync().await
     }
 
     /// Flush both L2 and refblock cache to disk.
@@ -198,9 +224,15 @@ impl<S: Storage> MetadataCaches<S> {
         let dir = self.direction.read().await;
         if *dir == CacheDependency::L2DependsOnRb {
             self.rb.flush().await?;
+            self.file.flush().await?;
+            self.file.sync().await?;
             self.l2.flush().await?;
         } else {
             self.l2.flush().await?;
+            if *dir == CacheDependency::RbDependsOnL2 {
+                self.file.flush().await?;
+                self.file.sync().await?;
+            }
             self.rb.flush().await?;
         }
 
@@ -218,6 +250,8 @@ impl<S: Storage> MetadataCaches<S> {
 
         if *dir == CacheDependency::L2DependsOnRb {
             self.rb.flush().await?;
+            self.file.flush().await?;
+            self.file.sync().await?;
         }
 
         // `unwrap()` is safe: Will never return `Ok(None)` with `may_flush` set to true.
@@ -238,6 +272,8 @@ impl<S: Storage> MetadataCaches<S> {
         if !self.l2.insert(cluster, Arc::clone(&table), false).await? {
             if *dir == CacheDependency::L2DependsOnRb {
                 self.rb.flush().await?;
+                self.file.flush().await?;
+                self.file.sync().await?;
             }
 
             let inserted = self.l2.insert(cluster, table, true).await?;
@@ -267,6 +303,8 @@ impl<S: Storage> MetadataCaches<S> {
 
         if *dir == CacheDependency::RbDependsOnL2 {
             self.l2.flush().await?;
+            self.file.flush().await?;
+            self.file.sync().await?;
         }
 
         // `unwrap()` is safe: Will never return `Ok(None)` with `may_flush` set to true.
@@ -287,6 +325,8 @@ impl<S: Storage> MetadataCaches<S> {
         if !self.rb.insert(cluster, Arc::clone(&rb), false).await? {
             if *dir == CacheDependency::RbDependsOnL2 {
                 self.l2.flush().await?;
+                self.file.flush().await?;
+                self.file.sync().await?;
             }
 
             let inserted = self.rb.insert(cluster, rb, true).await?;
@@ -297,13 +337,17 @@ impl<S: Storage> MetadataCaches<S> {
         Ok(())
     }
 
-    /// Flush the refblock cache to disk.
+    /// Flush the refblock cache and make it durable before publishing metadata pointers.
     pub async fn flush_rb(&self) -> io::Result<()> {
         let dir = self.direction.read().await;
         if *dir == CacheDependency::RbDependsOnL2 {
             self.l2.flush().await?;
+            self.file.flush().await?;
+            self.file.sync().await?;
         }
-        self.rb.flush().await
+        self.rb.flush().await?;
+        self.file.flush().await?;
+        self.file.sync().await
     }
 
     /// Invalidate the refblock cache.

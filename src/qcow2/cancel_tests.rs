@@ -77,15 +77,92 @@ async fn test_dropped_write_vs_discard_and_realloc() {
     );
 }
 
-/// A metadata table entry write whose future is dropped while it is still in flight must not
-/// overwrite data in a cluster that has been freed (by replacing the table) and reallocated in the
-/// meantime.
-///
-/// Here, the table is the L1 table: Dropping a guest write while its L1 entry write is in flight
-/// releases the L1 table lock, so growing the image can then replace the L1 table, freeing the old
-/// one.
+/// Cancelling a physical discard must retain ownership until its late I/O has completed.
 #[tokio::test]
-async fn test_dropped_l1_entry_write_vs_l1_growth_and_realloc() {
+async fn test_cancelled_physical_discard_keeps_clusters_owned() {
+    for version in [2u32, 3] {
+        let state = Arc::new(MemStorageState::default());
+        let image = create_image(&state, 64 * 1024).await;
+        image.flush().await.unwrap();
+        drop(image);
+        state.data.lock()[4..8].copy_from_slice(&version.to_be_bytes());
+        let image = open_image(&state).await;
+
+        image.write(&[0x11u8; 1024][..], 0).await.unwrap();
+        image.flush().await.unwrap();
+        image.sync().await.unwrap();
+        let old_offset = host_offset(&image, 0).await;
+        assert_eq!(host_offset(&image, 512).await, old_offset + 512);
+        let cluster = old_offset / 512;
+        let reftable = read_u64(&state, 48);
+        let refblock = read_u64(&state, reftable + (cluster / 256) * 8);
+        let refcount_offset = (refblock + (cluster % 256) * 2) as usize;
+        assert!(
+            cluster % 256 < 255,
+            "fixture must keep the run in one refblock"
+        );
+
+        state.hold_discards.store(true, Ordering::Relaxed);
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        // Only metadata flushes run concurrently; no data access holds a discarded mapping.
+        let mut discard = Box::pin(tokio::task::unconstrained(unsafe {
+            image.discard_to_zero_unsafe(0, 1024)
+        }));
+        assert!(discard.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(*state.held_discards.lock(), [(old_offset, 1024)]);
+        assert!(state.discarded.lock().is_empty());
+
+        // A concurrent flush must observe both final references while discard is pending.
+        image.flush().await.unwrap();
+        assert_eq!(
+            &state.data.lock()[refcount_offset..refcount_offset + 4],
+            &[0, 1, 0, 1]
+        );
+        drop(discard);
+        state.hold_discards.store(false, Ordering::Relaxed);
+
+        image.flush().await.unwrap();
+        image.sync().await.unwrap();
+        assert_eq!(
+            &state.data.lock()[refcount_offset..refcount_offset + 4],
+            &[0, 1, 0, 1]
+        );
+        let new_data = [0x33u8; 1024];
+        image.write(&new_data[..], 1024).await.unwrap();
+        for guest_offset in [1024, 1536] {
+            let new_offset = host_offset(&image, guest_offset).await;
+            assert!(new_offset < old_offset || new_offset >= old_offset + 1024);
+        }
+        image.flush().await.unwrap();
+        image.sync().await.unwrap();
+        assert_eq!(*state.held_discards.lock(), [(old_offset, 1024)]);
+
+        MemStorage::new(Arc::clone(&state), false)
+            .settle_writes()
+            .await
+            .unwrap();
+        assert!(state.held_discards.lock().is_empty());
+        assert_eq!(*state.discarded.lock(), [(old_offset, 1024)]);
+        assert_eq!(
+            &state.data.lock()[old_offset as usize..old_offset as usize + 1024],
+            &[0u8; 1024]
+        );
+        image.sync().await.unwrap();
+        drop(image);
+
+        let reopened = open_image(&state).await;
+        let mut actual = [0xa5u8; 2048];
+        reopened.read(&mut actual[..], 0).await.unwrap();
+        assert_eq!(&actual[..1024], &[0u8; 1024]);
+        assert_eq!(&actual[1024..], &new_data);
+        reopened.flush().await.unwrap();
+    }
+}
+
+/// An uncertain L1 publication must reject resizing and reallocation, even after its I/O completes.
+#[tokio::test]
+async fn test_dropped_l1_entry_rejects_resize_and_realloc() {
     let state = Arc::new(MemStorageState::default());
     let mut image = create_image(&state, 64 * 1024).await;
 
@@ -102,28 +179,24 @@ async fn test_dropped_l1_entry_write_vs_l1_growth_and_realloc() {
     state.hold_writes.store(false, Ordering::Relaxed);
     *state.hold_range.lock() = None;
 
-    // Grow the L1 table beyond its first cluster (64 entries of 32 KiB each), freeing the old one
     image
         .resize(4 * 1024 * 1024, PreallocateMode::None)
         .await
-        .unwrap();
-
-    // Allocate guest cluster 1 (whose L2 table exists already), which must reuse the old L1
-    // table’s cluster for this test to be meaningful
-    let new_data = [0x33u8; 512];
-    image.write(&new_data[..], 512).await.unwrap();
-    assert_eq!(host_offset(&image, 512).await, l1_offset);
-
-    // Now the dropped L1 entry write completes (unless it has already been settled before)
+        .unwrap_err();
+    image.write(&[0x33u8; 512][..], 512).await.unwrap_err();
+    image.flush().await.unwrap_err();
+    assert_eq!(
+        u64::from_be_bytes(state.data.lock()[40..48].try_into().unwrap()),
+        l1_offset
+    );
     state.complete_held_writes();
-
-    let mut buf = [0u8; 512];
-    image.read(&mut buf[..], 512).await.unwrap();
-    assert!(
-        buf == new_data,
-        "Expected {:#04x} bytes, read {:#04x} bytes",
-        new_data[0],
-        buf[0],
+    let mut buf = [0x5au8; 512];
+    image.read(&mut buf[..], 512).await.unwrap_err();
+    assert_eq!(buf, [0x5a; 512]);
+    image.flush().await.unwrap_err();
+    assert_eq!(
+        u64::from_be_bytes(state.data.lock()[40..48].try_into().unwrap()),
+        l1_offset
     );
 }
 
@@ -210,6 +283,88 @@ fn read_u64(state: &MemStorageState, offset: u64) -> u64 {
     let data = state.data.lock();
     let offset = offset as usize;
     u64::from_be_bytes(data[offset..offset + 8].try_into().unwrap())
+}
+
+#[tokio::test]
+async fn test_cancelled_cached_metadata_write_rejects_retry() {
+    for refblock in [false, true] {
+        let state = Arc::new(MemStorageState::default());
+        let image = create_image(&state, 2048).await;
+        image.write(&[0x5au8; 512][..], 0).await.unwrap();
+        image.flush().await.unwrap();
+        let offset = if refblock {
+            read_u64(&state, read_u64(&state, 48))
+        } else {
+            read_u64(&state, read_u64(&state, 40)) & 0x00ff_ffff_ffff_fe00
+        };
+        image.write(&[0x5au8; 512][..], 512).await.unwrap();
+        *state.hold_range.lock() = Some(offset..offset + 512);
+        state.hold_writes.store(true, Ordering::Relaxed);
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        // Poll to the injected I/O hold rather than a cooperative scheduler yield.
+        let mut first = Box::pin(tokio::task::unconstrained(image.flush()));
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(state.held.lock().len(), 1);
+        assert!(image.flush().now_or_never().is_none());
+        image.get_mapping(0, 512).await.unwrap();
+        let mut waiter = Box::pin(image.flush());
+        assert!(waiter.as_mut().poll(&mut cx).is_pending());
+        drop(first);
+        state.hold_writes.store(false, Ordering::Relaxed);
+        waiter.await.unwrap_err();
+        assert_eq!(state.held.lock().len(), 1);
+        image.write(&[0x33u8; 512][..], 1024).await.unwrap_err();
+        image.flush().await.unwrap_err();
+        image.sync().await.unwrap_err();
+        state.complete_held_writes();
+        let mut buf = [0xa5; 512];
+        image.read(&mut buf[..], 512).await.unwrap_err();
+        assert_eq!(buf, [0xa5; 512]);
+        image.flush().await.unwrap_err();
+    }
+}
+
+#[tokio::test]
+async fn test_cancelled_resize_rejects_retry() {
+    for (new_size, late_write) in [1536, 2560]
+        .into_iter()
+        .flat_map(|size| [false, true].map(|late_write| (size, late_write)))
+    {
+        let state = Arc::new(MemStorageState::default());
+        let mut image = create_image(&state, 2048).await;
+        image.write(&[0x5au8; 512][..], 0).await.unwrap();
+        image.flush().await.unwrap();
+        *state.hold_range.lock() = Some(0..72);
+        state.hold_writes.store(late_write, Ordering::Relaxed);
+        state.delay_writes.store(!late_write, Ordering::Relaxed);
+        assert!(image
+            .resize(new_size, PreallocateMode::None)
+            .now_or_never()
+            .is_none());
+        state.hold_writes.store(false, Ordering::Relaxed);
+        state.delay_writes.store(false, Ordering::Relaxed);
+        assert_eq!(image.size(), 2048);
+        image.resize(1536, PreallocateMode::None).await.unwrap_err();
+        image.resize(2560, PreallocateMode::None).await.unwrap_err();
+        image.flush().await.unwrap_err();
+        image.sync().await.unwrap_err();
+        state.complete_held_writes();
+        image.flush().await.unwrap_err();
+        drop(image);
+        let reopened = open_image(&state).await;
+        assert_eq!(
+            reopened.size(),
+            if late_write && new_size < 2048 {
+                new_size
+            } else {
+                2048
+            }
+        );
+        let mut buf = [0; 512];
+        reopened.read(&mut buf[..], 0).await.unwrap();
+        assert_eq!(buf, [0x5a; 512]);
+    }
 }
 
 /// Create a 512-byte-cluster image where the guest cluster at `guest_offset` is a compressed
@@ -368,7 +523,8 @@ async fn test_read_during_write_to_reused_cluster() {
     let freed_host_offset = host_offset(&image, 0).await;
     image.discard_to_zero(0, 512).await.unwrap();
 
-    // The freed host cluster still holds the old data
+    // Storage discard permits stale bytes; preserve the unpublished-mapping regression.
+    state.data.lock()[freed_host_offset as usize..freed_host_offset as usize + 512].fill(0x11);
     assert_eq!(state.data.lock()[freed_host_offset as usize], 0x11);
 
     let waker = futures::task::noop_waker();

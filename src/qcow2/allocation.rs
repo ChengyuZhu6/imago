@@ -146,12 +146,15 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     ///
     /// Returns an error for read-only images.
     async fn allocator(&self) -> io::Result<MutexGuard<'_, Allocator<S>>> {
-        Ok(self
+        self.header.ensure_healthy()?;
+        let allocator = self
             .allocator
             .as_ref()
             .ok_or_else(|| io::Error::other("Image is read-only"))?
             .lock()
-            .await)
+            .await;
+        self.header.ensure_healthy()?;
+        Ok(allocator)
     }
 
     /// Allocate one metadata cluster.
@@ -195,6 +198,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         &self,
         guest_cluster: GuestCluster,
     ) -> io::Result<PendingClusters> {
+        self.header.ensure_healthy()?;
         if self.header.external_data_file() {
             let cluster = HostCluster(guest_cluster.0);
             Ok(self
@@ -206,9 +210,13 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             // Allocate clusters before setting up L2 entries
             self.caches.l2_depends_on_rb().await?;
 
-            allocator
+            let allocation = allocator
                 .allocate_clusters(ClusterCount(1), None, false)
-                .await
+                .await?;
+            // A concurrent flush may have snapshotted the RB before this increment.
+            // Re-establish the dependency after updating it, before L2 can reference it.
+            self.caches.l2_depends_on_rb().await?;
+            Ok(allocation)
         }
     }
 
@@ -224,6 +232,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         guest_cluster: GuestCluster,
         mandatory_host_cluster: Option<HostCluster>,
     ) -> io::Result<Option<PendingClusters>> {
+        self.header.ensure_healthy()?;
         let Some(mandatory_host_cluster) = mandatory_host_cluster else {
             return self.allocate_data_cluster(guest_cluster).await.map(Some);
         };
@@ -241,13 +250,18 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
                 .await?
         };
 
-        Ok(allocated.then(|| {
+        let allocation = allocated.then(|| {
             self.clusters_to_free
                 .pending_guard(ClustersToFreeEntry::data(
                     mandatory_host_cluster,
                     ClusterCount(1),
                 ))
-        }))
+        });
+        if allocated && !self.header.external_data_file() {
+            // Revalidate the dependency after the refcount mutation, as above.
+            self.caches.l2_depends_on_rb().await?;
+        }
+        Ok(allocation)
     }
 
     /// Free all clusters in `self.clusters_to_free`.
@@ -298,6 +312,11 @@ impl<S: Storage> Allocator<S> {
         })
     }
 
+    /// Validate the layout of a self-contained writable image.
+    pub async fn validate_active_metadata(&self, l1: &L1Table) -> io::Result<()> {
+        validate_active_metadata(self.file.as_ref(), &self.header, l1, &self.reftable).await
+    }
+
     /// Free all clusters in `self.clusters_to_free` (i.e. decrement their refcount).
     ///
     /// Must not be called while allocating clusters: Freeing data clusters requires the refblock
@@ -306,6 +325,9 @@ impl<S: Storage> Allocator<S> {
     /// Best-effort operation.  On error, the given clusters may be leaked, but no errors are ever
     /// returned (because there is no good way to handle such errors anyway).
     async fn process_clusters_to_free(&mut self) {
+        if self.header.ensure_healthy().is_err() {
+            return;
+        }
         let (metadata_clusters, mut data_clusters): (Vec<_>, Vec<_>) = self
             .clusters_to_free
             .take()
@@ -330,26 +352,61 @@ impl<S: Storage> Allocator<S> {
         // In any case, all of these clusters will be in the qcow2 (metadata) file, because data
         // clusters in external data files do not need this treatment.
         if let Err(err) = self.file.settle_writes().await {
-            warn!("Leaking clusters; cannot settle writes: {err}");
+            warn!("Deferring cluster release; cannot settle writes: {err}");
+            for entry in metadata_clusters.into_iter().chain(data_clusters) {
+                self.clusters_to_free.push(entry);
+            }
             return;
         }
 
+        if !metadata_clusters.is_empty() {
+            // Old L1/L2/reftable references must be durable before their clusters are reusable.
+            let result = match self.file.flush().await {
+                Ok(()) => self.file.sync().await,
+                Err(err) => Err(err),
+            };
+            if let Err(err) = result {
+                warn!("Deferring cluster release; cannot persist metadata pointers: {err}");
+                for entry in metadata_clusters.into_iter().chain(data_clusters) {
+                    self.clusters_to_free.push(entry);
+                }
+                return;
+            }
+        }
         for entry in metadata_clusters {
-            self.free_clusters(entry.first_cluster, entry.count).await;
+            self.free_clusters(entry.first_cluster, entry.count, false)
+                .await;
         }
 
         if data_clusters.is_empty() {
             return;
         }
 
-        // Clear L2 entries before deallocating data clusters
-        if let Err(err) = self.caches.rb_depends_on_l2().await {
-            warn!("Leaking clusters; cannot set up cache dependency: {err}");
+        // Removed mappings must be durable before their data can be punched out.
+        let prepare = match self.caches.rb_depends_on_l2().await {
+            Ok(()) => self.caches.flush_l2().await,
+            Err(err) => Err(err),
+        };
+        if let Err(err) = prepare {
+            warn!("Cannot persist removed mappings; deferring data cluster release: {err}");
+            for entry in data_clusters {
+                self.clusters_to_free.push(entry);
+            }
             return;
         }
 
-        for entry in data_clusters {
-            self.free_clusters(entry.first_cluster, entry.count).await;
+        // Adjacent small clusters must reach the host's discard alignment together.
+        data_clusters.sort_unstable_by_key(|entry| entry.first_cluster);
+        let mut entries = data_clusters.into_iter().peekable();
+        while let Some(mut entry) = entries.next() {
+            while entries
+                .peek()
+                .is_some_and(|next| entry.first_cluster + entry.count == next.first_cluster)
+            {
+                entry.count += entries.next().unwrap().count;
+            }
+            self.free_clusters(entry.first_cluster, entry.count, true)
+                .await;
         }
     }
 
@@ -378,6 +435,7 @@ impl<S: Storage> Allocator<S> {
         end_cluster: Option<HostCluster>,
         metadata: bool,
     ) -> io::Result<PendingClusters> {
+        self.header.ensure_healthy()?;
         let mut index = self.first_free_cluster;
         loop {
             if end_cluster == Some(index) {
@@ -451,7 +509,8 @@ impl<S: Storage> Allocator<S> {
                 // Already allocated, or some real error occurred; free everything allocated so far.
                 // Do not go through `self.clusters_to_free`: As described above, the freed range
                 // must be available for allocation immediately, so that retrying converges.
-                self.free_clusters(start_index, index - start_index).await;
+                self.free_clusters(start_index, index - start_index, false)
+                    .await;
                 return result.map(|_| index - start_index);
             }
 
@@ -467,11 +526,13 @@ impl<S: Storage> Allocator<S> {
     /// Return `Ok(true)` if allocation was successful, or `Ok(false)` if the cluster was already
     /// allocated before.
     async fn allocate_cluster_at(&mut self, index: HostCluster) -> io::Result<bool> {
+        self.header.ensure_healthy()?;
         let rb_bits = self.header.rb_bits();
         let (rt_index, rb_index) = index.rt_rb_indices(rb_bits);
 
         let rb = self.ensure_rb(rt_index).await?;
         let mut rb = rb.lock_write().await;
+        self.header.ensure_healthy()?;
         let can_allocate = rb.is_zero(rb_index);
         if can_allocate {
             rb.increment(rb_index)?;
@@ -489,6 +550,7 @@ impl<S: Storage> Allocator<S> {
     ///
     /// If there is no refblock for the given reftable index, return `Ok(None)`.
     async fn get_rb(&mut self, rt_index: usize) -> io::Result<Option<Arc<RefBlock>>> {
+        self.header.ensure_healthy()?;
         let rt_entry = self.reftable.get(rt_index);
         if let Some(rb_offset) = rt_entry.refblock_offset() {
             let cb = self.header.cluster_bits();
@@ -538,6 +600,7 @@ impl<S: Storage> Allocator<S> {
         #[cfg(feature = "sync")]
         let alloc_result = alloc_fut_or_result;
 
+        self.header.ensure_healthy()?;
         let new_rb_allocation = if let Ok(new_rb_allocation) = alloc_result {
             new_rb.set_cluster(new_rb_allocation.cluster());
             Some(new_rb_allocation)
@@ -548,13 +611,33 @@ impl<S: Storage> Allocator<S> {
             new_rb.lock_write().await.increment(0)?;
             None
         };
-        new_rb.write(self.file.as_ref()).await?;
+        if new_rb_allocation.is_none() {
+            let mut initialization = DropGuard::new(|| {
+                self.header
+                    .publication_failed
+                    .store(true, Ordering::Release);
+            });
+            let result = new_rb.write(self.file.as_ref()).await;
+            initialization.disarm();
+            result?;
+        } else {
+            new_rb.write(self.file.as_ref()).await?;
+        }
+        self.caches.flush_rb().await?;
 
+        self.header.ensure_healthy()?;
         self.reftable
             .enter_refblock(rt_index, &new_rb, new_rb_allocation)?;
+        let mut publication = DropGuard::new(|| {
+            self.header
+                .publication_failed
+                .store(true, Ordering::Release);
+        });
         self.reftable
             .write_entry(self.file.as_ref(), rt_index)
             .await?;
+        self.header.ensure_healthy()?;
+        publication.disarm();
 
         let new_rb = Arc::new(new_rb);
         self.caches.rb_insert(Arc::clone(&new_rb)).await?;
@@ -567,6 +650,7 @@ impl<S: Storage> Allocator<S> {
     /// ensure it is refcounted itself (also creating new refblocks if necessary), and have the
     /// image header reference the new refcount table.
     async fn grow_reftable(&mut self, at_least_index: usize) -> io::Result<()> {
+        self.header.ensure_healthy()?;
         let cb = self.header.cluster_bits();
         let rb_bits = self.header.rb_bits();
         let rb_entries = 1 << rb_bits;
@@ -630,22 +714,20 @@ impl<S: Storage> Allocator<S> {
         let rt_index_start = index.rt_index(rb_bits);
         let rt_index_end = (index + count).0.div_ceil(rb_entries as u64) as usize;
 
-        let mut refblocks = Vec::<Arc<RefBlock>>::new();
+        let mut refblocks = Vec::<(Arc<RefBlock>, bool)>::new();
         for rt_i in rt_index_start..rt_index_end {
             if let Some(rb_offset) = new_rt.get(rt_i).refblock_offset() {
                 // Checked in the loop above
                 let rb_cluster = rb_offset.checked_cluster(cb).unwrap();
                 let rb = self.caches.rb_get_or_insert(rb_cluster).await?;
-                refblocks.push(rb);
+                refblocks.push((rb, false));
                 continue;
             }
 
             let mut rb = RefBlock::new_cleared(self.file.as_ref(), &self.header)?;
             rb.set_cluster(index);
             new_rt.enter_refblock(rt_i, &rb, None)?;
-            let rb = Arc::new(rb);
-            self.caches.rb_insert(Arc::clone(&rb)).await?;
-            refblocks.push(rb);
+            refblocks.push((Arc::new(rb), true));
             index += ClusterCount(1);
             count -= ClusterCount(1);
         }
@@ -665,6 +747,7 @@ impl<S: Storage> Allocator<S> {
             let rb_vec_i = rt_i - rt_index_start;
             // Incrementing from 0 to 1 must succeed
             refblocks[rb_vec_i]
+                .0
                 .lock_write()
                 .await
                 .increment(rb_i)
@@ -675,8 +758,22 @@ impl<S: Storage> Allocator<S> {
         // `refblocks` that are already part of the old reftable.
         // TODO: Try to clean that up, though it seems quite hard for little gain.
         self.caches.flush_rb().await?;
+        let mut publication = DropGuard::new(|| {
+            self.header
+                .publication_failed
+                .store(true, Ordering::Release);
+        });
+        for (rb, is_new) in &refblocks {
+            if *is_new {
+                rb.write(self.file.as_ref()).await?;
+            }
+        }
         new_rt.write(self.file.as_ref()).await?;
+        self.file.flush().await?;
+        self.file.sync().await?;
 
+        let header_locked = self.header.publication_lock.lock().await;
+        self.header.ensure_healthy()?;
         self.header.set_reftable(&new_rt)?;
         self.header
             .write_reftable_pointer(self.file.as_ref())
@@ -684,6 +781,8 @@ impl<S: Storage> Allocator<S> {
 
         // Must set new reftable before freeing the old reftable’s clusters
         let mut old_reftable = mem::replace(&mut self.reftable, new_rt);
+        publication.disarm();
+        drop(header_locked);
         if let Some(old_rt_cluster) = old_reftable.get_cluster() {
             let old_rt_size = old_reftable.cluster_count();
             old_reftable.unset_cluster();
@@ -694,15 +793,25 @@ impl<S: Storage> Allocator<S> {
                 .push(ClustersToFreeEntry::metadata(old_rt_cluster, old_rt_size));
         }
 
-        Ok(())
+        for (rb, is_new) in refblocks {
+            if is_new {
+                self.caches.rb_insert(rb).await?;
+            }
+        }
+        self.header.ensure_healthy()
     }
 
     /// Free clusters (i.e. decrement their refcount).
     ///
     /// Best-effort operation.  On error, the given clusters may be leaked, but no errors are ever
     /// returned (because there is no good way to handle such errors anyway).
-    async fn free_clusters(&mut self, start: HostCluster, mut count: ClusterCount) {
-        if count.0 == 0 {
+    async fn free_clusters(
+        &mut self,
+        mut start: HostCluster,
+        mut count: ClusterCount,
+        discard: bool,
+    ) {
+        if count.0 == 0 || self.header.ensure_healthy().is_err() {
             return;
         }
 
@@ -718,12 +827,43 @@ impl<S: Storage> Allocator<S> {
             let in_rb_count = cmp::min((rb_entries - rb_index) as u64, count.0) as usize;
 
             match self.get_rb(rt_index).await {
-                Ok(Some(rb)) => {
-                    let mut rb = rb.lock_write().await;
-                    for i in rb_index..(rb_index + in_rb_count) {
+                Ok(Some(refblock)) => {
+                    let mut rb = refblock.lock_write().await;
+                    if self.header.ensure_healthy().is_err() {
+                        return;
+                    }
+                    let end = rb_index + in_rb_count;
+                    let mut i = rb_index;
+                    while i < end {
+                        if discard && refblock.get(i) == 1 {
+                            let cluster = start + ClusterCount((i - rb_index) as u64);
+                            let offset = cluster.offset(self.header.cluster_bits());
+                            let first = i;
+                            while i < end && refblock.get(i) == 1 {
+                                i += 1;
+                            }
+                            let count = ClusterCount((i - first) as u64);
+                            // Keep the last reference until discard completes: cancellation must
+                            // not let an in-flight discard target a subsequently reused cluster.
+                            if let Err(err) = self
+                                .file
+                                .discard(offset.0, count.byte_size(self.header.cluster_bits()))
+                                .await
+                            {
+                                warn!("Cannot reclaim data cluster at {offset:?}: {err}");
+                                self.clusters_to_free
+                                    .push(ClustersToFreeEntry::data(cluster, count));
+                                continue;
+                            }
+                            for index in first..i {
+                                rb.decrement(index).unwrap();
+                            }
+                            continue;
+                        }
                         if let Err(err) = rb.decrement(i) {
                             event!(Level::WARN, "Failed to free cluster: {err}");
                         }
+                        i += 1;
                     }
                 }
 
@@ -733,10 +873,17 @@ impl<S: Storage> Allocator<S> {
                         "Failed to free {in_rb_count} clusters: Not allocated"
                     )
                 }
-                Err(err) => event!(Level::WARN, "Failed to free {in_rb_count} clusters: {err}"),
+                Err(err) => {
+                    event!(Level::WARN, "Failed to free {in_rb_count} clusters: {err}");
+                    let mut entry =
+                        ClustersToFreeEntry::data(start, ClusterCount(in_rb_count as u64));
+                    entry.metadata = !discard;
+                    self.clusters_to_free.push(entry);
+                }
             }
 
             count -= ClusterCount(in_rb_count as u64);
+            start += ClusterCount(in_rb_count as u64);
             rb_index = 0;
             rt_index += 1;
         }
@@ -747,6 +894,257 @@ impl<S: Storage> Allocator<S> {
 mod tests {
     use super::*;
     use crate::null::Null;
+    use crate::test::mem_storage::{MemStorage, MemStorageState};
+    use crate::DenyImplicitOpenGate;
+
+    /// Exercise one metadata publication site.
+    #[maybe_async]
+    async fn publish_metadata(qcow2: &Qcow2<MemStorage>, site: usize) -> io::Result<()> {
+        match site {
+            0 => qcow2.ensure_l2(GuestOffset(0)).await.map(|_| ()),
+            1 => qcow2.allocator().await?.ensure_rb(1).await.map(|_| ()),
+            2 => {
+                let l1 = qcow2.l1_table.write().await;
+                let index = l1.entries();
+                qcow2.grow_l1_table(l1, index).await.map(|_| ())
+            }
+            3 => {
+                let index = qcow2.header.reftable_entries();
+                qcow2.allocator().await?.grow_reftable(index).await
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_metadata_publication_fail_closed() {
+        #[cfg(feature = "sync")]
+        let cancellation_modes = [false];
+        #[cfg(feature = "async")]
+        let cancellation_modes = [false, true];
+        for site in 0..4 {
+            for cancel in cancellation_modes {
+                let state = Arc::new(MemStorageState::default());
+                let qcow2 =
+                    Qcow2::<MemStorage>::create_builder(MemStorage::new(Arc::clone(&state), false))
+                        .cluster_size(512)
+                        .size(64 * 1024)
+                        .create_open(DenyImplicitOpenGate::default(), |image| {
+                            Ok(Qcow2::<MemStorage>::builder(image)
+                                .backing(None)
+                                .write(true))
+                        })
+                        .await
+                        .unwrap();
+                let prepared = qcow2
+                    .prepare_data_mapping(32 * 1024, 512, true)
+                    .await
+                    .unwrap();
+                let pending = qcow2.allocate_meta_cluster().await.unwrap();
+                let cluster = pending.cluster();
+                let (rt_index, rb_index) = cluster.rt_rb_indices(qcow2.header.rb_bits());
+                let rb = qcow2
+                    .allocator()
+                    .await
+                    .unwrap()
+                    .get_rb(rt_index)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                qcow2.flush().await.unwrap();
+                let offset = match site {
+                    0 => qcow2.header.l1_table_offset().0,
+                    1 => qcow2.header.reftable_offset().0 + 8,
+                    _ => 0,
+                };
+                let before = state.data.lock()[offset as usize..offset as usize + 8].to_vec();
+                if cancel {
+                    #[cfg(feature = "async")]
+                    {
+                        use futures::task::noop_waker;
+                        use std::future::Future;
+                        use std::task::Context;
+
+                        *state.hold_range.lock() = Some(offset..offset + 8);
+                        state.hold_writes.store(true, Ordering::Relaxed);
+                        let waker = noop_waker();
+                        let mut cx = Context::from_waker(&waker);
+                        // Reach the injected I/O hold even if the task's coop budget is spent.
+                        let mut publication =
+                            Box::pin(tokio::task::unconstrained(publish_metadata(&qcow2, site)));
+                        assert!(publication.as_mut().poll(&mut cx).is_pending());
+                        assert_eq!(state.held.lock()[0].0, offset);
+                        assert!(qcow2.header.ensure_healthy().is_ok());
+                        let waiter_site = if site == 2 { 3 } else { site };
+                        let mut waiter = Box::pin(publish_metadata(&qcow2, waiter_site));
+                        assert!(waiter.as_mut().poll(&mut cx).is_pending());
+                        assert_eq!(state.held.lock().len(), 1);
+                        drop(publication);
+                        waiter.await.err().unwrap();
+                    }
+                } else {
+                    *state.fail_write_offset.lock() = Some(offset);
+                    publish_metadata(&qcow2, site).await.err().unwrap();
+                    assert_eq!(*state.failed.lock(), [offset]);
+                }
+                assert_eq!(
+                    &state.data.lock()[offset as usize..offset as usize + 8],
+                    before.as_slice()
+                );
+                assert!(qcow2.header.ensure_healthy().is_err());
+                qcow2.commit_data_mapping(prepared).await.unwrap_err();
+                qcow2.get_mapping(0, 512).await.err().unwrap();
+                qcow2.get_mapping(qcow2.size(), 0).await.err().unwrap();
+                qcow2.prepare_data_mapping(0, 0, true).await.err().unwrap();
+                qcow2.ensure_zero_mapping(0, 512).await.err().unwrap();
+                qcow2.allocate_meta_cluster().await.err().unwrap();
+                qcow2.flush().await.unwrap_err();
+                qcow2.sync().await.unwrap_err();
+                qcow2
+                    .header
+                    .write_size(qcow2.metadata.as_ref(), qcow2.size())
+                    .await
+                    .unwrap_err();
+                drop(pending);
+                qcow2.process_clusters_to_free().await;
+                let mut allocator = qcow2.allocator.as_ref().unwrap().lock().await;
+                allocator.process_clusters_to_free().await;
+                allocator
+                    .free_clusters(cluster, ClusterCount(1), false)
+                    .await;
+                assert_eq!(rb.get(rb_index), 1);
+                allocator.allocate_cluster_at(cluster).await.unwrap_err();
+                drop(allocator);
+                #[cfg(feature = "async")]
+                if cancel {
+                    state.complete_held_writes();
+                    state.release_held_writes();
+                    qcow2.flush().await.unwrap_err();
+                    qcow2.get_mapping(0, 512).await.err().unwrap();
+                }
+            }
+        }
+    }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_metadata_publication_cache_write_retryable() {
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = Qcow2::<MemStorage>::create_builder(MemStorage::new(Arc::clone(&state), false))
+            .cluster_size(512)
+            .size(64 * 1024)
+            .create_open(DenyImplicitOpenGate::default(), |image| {
+                Ok(Qcow2::<MemStorage>::builder(image)
+                    .backing(None)
+                    .write(true))
+            })
+            .await
+            .unwrap();
+        state.fail_next_write.store(true, Ordering::Relaxed);
+        qcow2.ensure_l2(GuestOffset(0)).await.err().unwrap();
+        qcow2.header.ensure_healthy().unwrap();
+        qcow2.ensure_data_mapping(0, 512, true).await.unwrap();
+        qcow2.flush().await.unwrap();
+        let l2_offset = qcow2.l1_table.read().await.get(0).l2_offset().unwrap().0;
+        let rb_offset = qcow2
+            .allocator()
+            .await
+            .unwrap()
+            .reftable
+            .get(0)
+            .refblock_offset()
+            .unwrap()
+            .0;
+        for offset in [rb_offset, l2_offset] {
+            qcow2.ensure_data_mapping(512, 512, true).await.unwrap();
+            qcow2.ensure_zero_mapping(0, 512).await.unwrap();
+            *state.fail_write_offset.lock() = Some(offset);
+            qcow2.flush().await.unwrap_err();
+            qcow2.header.ensure_healthy().unwrap();
+            qcow2.flush().await.unwrap();
+            qcow2.ensure_data_mapping(0, 512, true).await.unwrap();
+            qcow2.flush().await.unwrap();
+        }
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn test_metadata_publication_private_rb_and_serialized_header() {
+        use futures::task::noop_waker;
+        use std::future::Future;
+        use std::task::Context;
+
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = Qcow2::<MemStorage>::create_builder(MemStorage::new(Arc::clone(&state), false))
+            .cluster_size(512)
+            .size(64 * 1024)
+            .create_open(DenyImplicitOpenGate::default(), |image| {
+                Ok(Qcow2::<MemStorage>::builder(image)
+                    .backing(None)
+                    .write(true))
+            })
+            .await
+            .unwrap();
+        let index = qcow2.header.reftable_entries();
+        let cluster = HostCluster::from_ref_indices(index, 0, qcow2.header.rb_bits());
+        qcow2.allocator().await.unwrap().first_free_cluster = cluster;
+        qcow2.flush().await.unwrap();
+        let offset = cluster.offset(qcow2.header.cluster_bits()).0;
+        *state.hold_range.lock() = Some(offset..offset + 512);
+        state.hold_writes.store(true, Ordering::Relaxed);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut preparation = Box::pin(publish_metadata(&qcow2, 3));
+        assert!(preparation.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(state.held.lock()[0].0, offset);
+        drop(preparation);
+        state.complete_held_writes();
+        state.release_held_writes();
+        qcow2.header.ensure_healthy().unwrap_err();
+        qcow2.get_mapping(0, 512).await.err().unwrap();
+        qcow2.flush().await.unwrap_err();
+        let reused = vec![0x5a; 512];
+        state.write(offset, &reused);
+        qcow2.caches.flush_rb().await.unwrap_err();
+        assert_eq!(
+            &state.data.lock()[offset as usize..offset as usize + 512],
+            reused.as_slice()
+        );
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = Qcow2::<MemStorage>::create_builder(MemStorage::new(Arc::clone(&state), false))
+            .cluster_size(512)
+            .size(64 * 1024)
+            .create_open(DenyImplicitOpenGate::default(), |image| {
+                Ok(Qcow2::<MemStorage>::builder(image)
+                    .backing(None)
+                    .write(true))
+            })
+            .await
+            .unwrap();
+        qcow2.flush().await.unwrap();
+        *state.hold_range.lock() = Some(0..512);
+        state.release_writes.store(false, Ordering::Relaxed);
+        state.hold_writes.store(true, Ordering::Relaxed);
+        let mut l1_publication = Box::pin(publish_metadata(&qcow2, 2));
+        assert!(l1_publication.as_mut().poll(&mut cx).is_pending());
+        let mut rt_publication = Box::pin(publish_metadata(&qcow2, 3));
+        assert!(rt_publication.as_mut().poll(&mut cx).is_pending());
+        let new_size = qcow2.size() + 512;
+        let mut size_publication =
+            Box::pin(qcow2.header.write_size(qcow2.metadata.as_ref(), new_size));
+        assert!(size_publication.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(state.held.lock().len(), 1);
+        state.release_held_writes();
+        l1_publication.await.unwrap();
+        rt_publication.await.unwrap();
+        size_publication.await.unwrap();
+        let reopened = Header::load(qcow2.metadata.as_ref(), false).await.unwrap();
+        assert_eq!(reopened.size(), new_size);
+        assert_eq!(reopened.l1_table_offset(), qcow2.header.l1_table_offset());
+        assert_eq!(reopened.l1_table_entries(), qcow2.header.l1_table_entries());
+        assert_eq!(reopened.reftable_offset(), qcow2.header.reftable_offset());
+        assert_eq!(reopened.reftable_entries(), qcow2.header.reftable_entries());
+        qcow2.flush().await.unwrap();
+    }
 
     /// Regression test for a bug in `Allocator::grow_reftable()`'s free-space search loop: when it
     /// hit a reftable index that had no refblock at all (i.e. a range that has never been

@@ -51,6 +51,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             } => ShallowMapping::Raw {
                 storage: self.storage(),
                 offset: host_cluster.relative_offset(offset, cb).0,
+                read_exact: true,
                 writable: copied,
             },
 
@@ -133,6 +134,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         if let ShallowMapping::Raw {
             storage: _,
             offset,
+            read_exact: _,
             writable: true,
         } = existing.0
         {
@@ -142,6 +144,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         }
 
         let l2_table = l2_table.lock_write().await;
+        self.header.ensure_healthy()?;
 
         let mut l2_changes = Vec::new();
         let res = self
@@ -166,6 +169,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             }
         };
 
+        self.header.ensure_healthy()?;
         // Everything may turn out to be mapped already, e.g. when a concurrent request has mapped
         // it while we were waiting for the lock
         let prepared_mapping = (!l2_changes.is_empty()).then(|| PreparedMappingState {
@@ -181,6 +185,9 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     ///
     /// Underlying implementation for [`Qcow2::commit_data_mapping()`].
     pub(super) async fn do_commit_data_mapping(&self, state: PreparedMappingState) {
+        if self.header.ensure_healthy().is_err() {
+            return;
+        }
         let PreparedMappingState {
             mut l2_table,
             l2_changes,
@@ -241,6 +248,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
         let l2_table = self.ensure_l2(first_cluster.offset(cb)).await?;
         let l2_table = l2_table.lock_write().await;
+        self.header.ensure_healthy()?;
 
         let res = self
             .ensure_fixed_mapping_no_cleanup(first_cluster, cluster_count, mapping, l2_table)
@@ -274,7 +282,12 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     ) -> io::Result<Option<Arc<L2Table>>> {
         let cb = self.header.cluster_bits();
 
-        let l1_entry = self.l1_table.read().await.get(offset.l1_index(cb));
+        let l1_locked = self.l1_table.read().await;
+        if writable {
+            self.header.ensure_healthy()?;
+        }
+        let l1_entry = l1_locked.get(offset.l1_index(cb));
+        drop(l1_locked);
         if let Some(l2_offset) = l1_entry.l2_offset() {
             if writable && !l1_entry.is_copied() {
                 return Ok(None);
@@ -285,7 +298,9 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 ))
             })?;
 
-            self.caches.l2_get_or_insert(l2_cluster).await.map(Some)
+            let l2 = self.caches.l2_get_or_insert(l2_cluster).await?;
+            self.header.ensure_healthy()?;
+            Ok(Some(l2))
         } else {
             Ok(None)
         }
@@ -302,9 +317,10 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             return Ok(l2);
         }
 
-        self.need_writable()?;
+        self.need_writable().await?;
 
         let mut l1_locked = self.l1_table.write().await;
+        self.header.ensure_healthy()?;
         let l1_index = offset.l1_index(cb);
         if !l1_locked.in_bounds(l1_index) {
             l1_locked = self.grow_l1_table(l1_locked, l1_index).await?;
@@ -319,6 +335,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             })?;
 
             let l2 = self.caches.l2_get_or_insert(l2_cluster).await?;
+            self.header.ensure_healthy()?;
             if l1_entry.is_copied() {
                 return Ok(l2);
             }
@@ -331,11 +348,21 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         let l2_allocation = self.allocate_meta_cluster().await?;
         l2_table.set_cluster(l2_allocation.cluster());
         l2_table.write(self.metadata.as_ref()).await?;
+        // Unlike cached L2 entries, the L1 entry is written immediately.
+        self.caches.flush_rb().await?;
 
+        self.header.ensure_healthy()?;
         l1_locked.enter_l2_table(l1_index, &l2_table, Some(l2_allocation))?;
+        let mut publication = DropGuard::new(|| {
+            self.header
+                .publication_failed
+                .store(true, Ordering::Release);
+        });
         l1_locked
             .write_entry(self.metadata.as_ref(), l1_index)
             .await?;
+        self.header.ensure_healthy()?;
+        publication.disarm();
 
         // Free old L2 table, if any
         if let Some(l2_offset) = l1_entry.l2_offset() {
@@ -348,6 +375,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
         let l2_table = Arc::new(l2_table);
         self.caches.l2_insert(Arc::clone(&l2_table)).await?;
+        self.header.ensure_healthy()?;
         Ok(l2_table)
     }
 
@@ -359,28 +387,38 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         mut l1_locked: RwLockWriteGuard<'a, L1Table>,
         at_least_index: usize,
     ) -> io::Result<RwLockWriteGuard<'a, L1Table>> {
+        self.header.ensure_healthy()?;
         let mut new_l1 = l1_locked.clone_and_grow(at_least_index, &self.header)?;
 
         let l1_allocation = self.allocate_meta_clusters(new_l1.cluster_count()).await?;
 
         new_l1.set_cluster(l1_allocation.cluster());
         new_l1.write(self.metadata.as_ref()).await?;
+        self.caches.flush_rb().await?;
 
+        let header_locked = self.header.publication_lock.lock().await;
+        self.header.ensure_healthy()?;
         self.header.set_l1_table(&new_l1, Some(l1_allocation))?;
+        let mut publication = DropGuard::new(|| {
+            self.header
+                .publication_failed
+                .store(true, Ordering::Release);
+        });
         self.header
             .write_l1_table_pointer(self.metadata.as_ref())
             .await?;
 
-        if let Some(old_l1_cluster) = l1_locked.get_cluster() {
-            let old_l1_size = l1_locked.cluster_count();
-            l1_locked.unset_cluster();
+        let mut old_l1 = std::mem::replace(&mut *l1_locked, new_l1);
+        publication.disarm();
+        drop(header_locked);
+        if let Some(old_l1_cluster) = old_l1.get_cluster() {
+            let old_l1_size = old_l1.cluster_count();
+            old_l1.unset_cluster();
             self.clusters_to_free
                 .push(ClustersToFreeEntry::metadata(old_l1_cluster, old_l1_size));
-            self.process_clusters_to_free().await;
         }
 
-        *l1_locked = new_l1;
-
+        self.header.ensure_healthy()?;
         Ok(l1_locked)
     }
 
@@ -606,6 +644,417 @@ mod tests {
             .unwrap()
     }
 
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_l2_pointer_has_refcount_before_flush() {
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = create_image(&state, 32768, 16).await;
+        qcow2.ensure_l2(GuestOffset(0)).await.unwrap();
+        drop(qcow2); // Simulate losing the userspace caches before an explicit flush.
+
+        let data = state.data.lock();
+        let load_u64 = |at| u64::from_be_bytes(data[at..at + 8].try_into().unwrap());
+        let l1 = load_u64(40) as usize;
+        let rt = load_u64(48) as usize;
+        let rb = load_u64(rt) as usize;
+        let l2 = (load_u64(l1) & !(1 << 63)) as usize;
+        assert_ne!(l2, 0);
+        let refcount_at = rb + (l2 / 512) * 2;
+        assert_eq!(&data[refcount_at..refcount_at + 2], &1u16.to_be_bytes());
+    }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_self_contained_writable_metadata_overlaps() {
+        use crate::FormatDriverBuilder;
+
+        let state = Arc::new(MemStorageState::default());
+        let access = FormatAccess::new(create_image(&state, 32768, 16).await);
+        access.write(&[0x5a; 512][..], 0).await.unwrap();
+        access.flush().await.unwrap();
+        drop(access);
+
+        let (l1, rt, l2, rb, clean) = {
+            let data = state.data.lock();
+            let load_u64 = |at| u64::from_be_bytes(data[at..at + 8].try_into().unwrap()) as usize;
+            let l1 = load_u64(40);
+            let rt = load_u64(48);
+            (
+                l1,
+                rt,
+                load_u64(l1) & !(1 << 63),
+                load_u64(rt),
+                data.clone(),
+            )
+        };
+
+        for (at, value) in [
+            (40, rt as u64),
+            (l1, rb as u64 | 1 << 63),
+            (l2, rb as u64 | 1 << 63),
+            (l2, rb as u64 | 1 << 62),
+            (rb, 0),
+            (rt, l2 as u64),
+        ] {
+            let mut malformed = clean.clone();
+            malformed[at..at + 8].copy_from_slice(&value.to_be_bytes());
+            state.data.lock().clone_from(&malformed);
+            let storage = MemStorage::new(Arc::clone(&state), false);
+            let result = Qcow2::<MemStorage>::builder(storage)
+                .write(true)
+                .require_self_contained(true)
+                .open(DenyImplicitOpenGate::default())
+                .await;
+            assert_eq!(result.err().unwrap().kind(), io::ErrorKind::InvalidData);
+            assert_eq!(*state.data.lock(), malformed);
+        }
+    }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_autoclear_before_first_write() {
+        let state = Arc::new(MemStorageState::default());
+        drop(create_image(&state, 512, 16).await);
+        let original = {
+            let mut data = state.data.lock();
+            data[88..96].copy_from_slice(&(1u64 << 63).to_be_bytes());
+            data.clone()
+        };
+        for field in [40..48, 48..56] {
+            let malformed = {
+                let mut data = state.data.lock();
+                data.clone_from(&original);
+                data[field].copy_from_slice(&4096u64.to_be_bytes());
+                data.clone()
+            };
+            let result =
+                Qcow2::<MemStorage>::open_image(MemStorage::new(Arc::clone(&state), false), true)
+                    .await;
+            assert_eq!(result.err().unwrap().kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(*state.data.lock(), malformed);
+        }
+        state.data.lock().clone_from(&original);
+        let image =
+            Qcow2::<MemStorage>::open_image(MemStorage::new(Arc::clone(&state), false), true)
+                .await
+                .unwrap();
+        assert_eq!(*state.data.lock(), original);
+        let access = FormatAccess::new(image);
+        access.write(&[0xa5; 512][..], 0).await.unwrap();
+        assert_eq!(&state.data.lock()[88..96], &[0; 8]);
+    }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_external_data_file_open_mode() {
+        use crate::file::File;
+        use crate::format::gate::ImplicitOpenGate;
+        use crate::FormatDriverBuilder;
+
+        struct DataFileGate(bool);
+
+        #[maybe_async::maybe_async(AFIT)]
+        impl ImplicitOpenGate<File> for DataFileGate {
+            async fn open_format<F: FormatDriverBuilder<File>>(
+                &mut self,
+                builder: F,
+            ) -> io::Result<FormatAccess<File>> {
+                DenyImplicitOpenGate::default().open_format(builder).await
+            }
+
+            async fn open_storage(&mut self, options: StorageOpenOptions) -> io::Result<File> {
+                assert_eq!(options.get_writable(), self.0);
+                File::open(options).await
+            }
+        }
+
+        let path =
+            std::env::temp_dir().join(format!("imago-qcow2-external-{}.qcow2", std::process::id()));
+        let data_path = path.with_extension("data");
+        let _cleanup = crate::misc_helpers::DropGuard::new(|| {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&data_path);
+        });
+        std::fs::write(&path, []).unwrap();
+        std::fs::write(&data_path, []).unwrap();
+        let metadata = File::open(StorageOpenOptions::new().filename(&path).write(true))
+            .await
+            .unwrap();
+        let data = File::open(StorageOpenOptions::new().filename(&data_path).write(true))
+            .await
+            .unwrap();
+        let qcow2 = Qcow2::<File>::create_builder(metadata)
+            .cluster_size(512)
+            .size(1024)
+            .data_file(
+                data_path.file_name().unwrap().to_str().unwrap().to_owned(),
+                data,
+            )
+            .create_open(DenyImplicitOpenGate::default(), |image| {
+                Ok(Qcow2::<File>::builder(image))
+            })
+            .await
+            .unwrap();
+        let image = FormatAccess::new(qcow2);
+        image.write(&[0x5au8; 512][..], 0).await.unwrap();
+        image.flush().await.unwrap();
+        drop(image);
+        let original_metadata = std::fs::read(&path).unwrap();
+        let original_data = std::fs::read(&data_path).unwrap();
+        for writable in [false, true] {
+            for implicit in [false, true] {
+                let metadata =
+                    File::open(StorageOpenOptions::new().filename(&path).write(writable))
+                        .await
+                        .unwrap();
+                let qcow2 = if implicit {
+                    let mut qcow2 = Qcow2::<File>::open_image(metadata, writable).await.unwrap();
+                    qcow2
+                        .open_implicit_dependencies_gated(DataFileGate(writable))
+                        .await
+                        .unwrap();
+                    qcow2
+                } else {
+                    Qcow2::<File>::builder(metadata)
+                        .write(writable)
+                        .open(DataFileGate(writable))
+                        .await
+                        .unwrap()
+                };
+                let image = FormatAccess::new(qcow2);
+                let mut buf = [0; 512];
+                image.read(&mut buf[..], 0).await.unwrap();
+                assert_eq!(buf, [0x5a; 512]);
+                drop(image);
+                assert_eq!(std::fs::read(&path).unwrap(), original_metadata);
+                assert_eq!(std::fs::read(&data_path).unwrap(), original_data);
+            }
+        }
+    }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_read_truncated_image() {
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = create_image(&state, 1024, 16).await;
+        let header = Arc::clone(&qcow2.header);
+        let image = FormatAccess::new(qcow2);
+        image.write(&[0x5au8; 512][..], 0).await.unwrap();
+        image.flush().await.unwrap();
+        let (Mapping::Raw { offset, .. }, _) = image.get_mapping(0, 512).await.unwrap() else {
+            panic!("Expected a data mapping");
+        };
+        let original = state.data.lock().clone();
+        drop(image);
+
+        let path = std::env::temp_dir().join(format!(
+            "imago-qcow2-read-truncated-{}.qcow2",
+            std::process::id()
+        ));
+        let _cleanup = crate::misc_helpers::DropGuard::new(|| {
+            let _ = std::fs::remove_file(&path);
+        });
+        let open_file = || {
+            crate::file::File::from_open_file(
+                std::fs::File::open(&path).unwrap(),
+                StorageOpenOptions::new().filename(&path),
+            )
+            .unwrap()
+        };
+        for present in [512, 511, 0] {
+            std::fs::write(&path, &original).unwrap();
+            let qcow2 = Qcow2::<crate::file::File>::builder(open_file())
+                .open(DenyImplicitOpenGate::default())
+                .await
+                .unwrap();
+            let image = FormatAccess::new(qcow2);
+            let raw = FormatAccess::new(Raw::open_image(open_file(), false).await.unwrap());
+            let external = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            external.set_len(offset + present as u64).unwrap();
+            let mut buf = [0xa5u8; 512];
+            let result = image.read(&mut buf[..], 0).await;
+            if present == buf.len() {
+                result.unwrap();
+                assert_eq!(buf, [0x5a; 512]);
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+                let mut byte = [0xa5u8];
+                let err = image.read(&mut byte[..], present as u64).await.unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+            }
+            if present > 0 {
+                image.read(&mut buf[..present], 0).await.unwrap();
+                assert!(buf[..present].iter().all(|&byte| byte == 0x5a));
+            }
+            image.read(&mut buf[..], 512).await.unwrap();
+            assert_eq!(buf, [0; 512]);
+            buf.fill(0xa5);
+            image.read(&mut buf[..], 1024).await.unwrap();
+            assert_eq!(buf, [0; 512]);
+            raw.read(&mut buf[..], offset).await.unwrap();
+            assert!(buf[..present].iter().all(|&byte| byte == 0x5a));
+            assert!(buf[present..].iter().all(|&byte| byte == 0));
+        }
+
+        for present in [512, 511, 0] {
+            *state.data.lock() = original.clone();
+            state.data.lock().truncate(offset as usize + present);
+            let qcow2 = Qcow2::<MemStorage>::builder(MemStorage::new(Arc::clone(&state), false))
+                .open(DenyImplicitOpenGate::default())
+                .await
+                .unwrap();
+            let image = FormatAccess::new(qcow2);
+            let mut buf = [0xa5u8; 512];
+            let result = image.read(&mut buf[..], 0).await;
+            if present == buf.len() {
+                result.unwrap();
+                assert_eq!(buf, [0x5a; 512]);
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+                assert_eq!(buf, [0xa5; 512]);
+                let mut byte = [0xa5u8];
+                let err = image.read(&mut byte[..], present as u64).await.unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+            }
+            if present > 0 {
+                image.read(&mut buf[..present], 0).await.unwrap();
+                assert!(buf[..present].iter().all(|&byte| byte == 0x5a));
+            }
+            image.read(&mut buf[..], 512).await.unwrap();
+            assert_eq!(buf, [0; 512]);
+            buf.fill(0xa5);
+            image.read(&mut buf[..], 1024).await.unwrap();
+            assert_eq!(buf, [0; 512]);
+        }
+
+        let read_offset = |offset: usize| {
+            u64::from_be_bytes(original[offset..offset + 8].try_into().unwrap())
+                & 0x00ff_ffff_ffff_fe00
+        };
+        let l1_offset = header.l1_table_offset().0;
+        let rt_offset = header.reftable_offset().0;
+        for (name, offset, entries) in [
+            ("L1", l1_offset, header.l1_table_entries()),
+            ("L2", read_offset(l1_offset as usize), header.l2_entries()),
+            ("RT", rt_offset, header.reftable_entries()),
+            ("RB", read_offset(rt_offset as usize), 64),
+        ] {
+            for present in [0, entries * 8 - 1, entries * 8] {
+                *state.data.lock() = original.clone();
+                state.data.lock().truncate(offset as usize + present);
+                let storage = MemStorage::new(Arc::clone(&state), false);
+                let cluster = HostOffset(offset)
+                    .checked_cluster(header.cluster_bits())
+                    .unwrap();
+                let result = match name {
+                    "L1" => L1Table::load(&storage, &header, cluster, entries)
+                        .await
+                        .map(|_| ()),
+                    "L2" => L2Table::load(&storage, &header, cluster, entries)
+                        .await
+                        .map(|_| ()),
+                    "RT" => RefTable::load(&storage, &header, cluster, entries)
+                        .await
+                        .map(|_| ()),
+                    "RB" => RefBlock::load(&storage, &header, cluster).await.map(|_| ()),
+                    _ => unreachable!(),
+                };
+                if present == entries * 8 {
+                    result.unwrap();
+                } else {
+                    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+                }
+
+                std::fs::write(&path, &original).unwrap();
+                let storage = open_file();
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(offset + present as u64)
+                    .unwrap();
+                let result = match name {
+                    "L1" => L1Table::load(&storage, &header, cluster, entries)
+                        .await
+                        .map(|_| ()),
+                    "L2" => L2Table::load(&storage, &header, cluster, entries)
+                        .await
+                        .map(|_| ()),
+                    "RT" => RefTable::load(&storage, &header, cluster, entries)
+                        .await
+                        .map(|_| ()),
+                    "RB" => RefBlock::load(&storage, &header, cluster).await.map(|_| ()),
+                    _ => unreachable!(),
+                };
+                if present == entries * 8 {
+                    result.unwrap();
+                } else {
+                    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+                }
+            }
+        }
+
+        for length in [0, 71, 72, 103, 104, 111, 112, 113] {
+            *state.data.lock() = original[..length].to_vec();
+            let storage = MemStorage::new(Arc::clone(&state), false);
+            let result = Header::load(&storage, false).await;
+            assert_eq!(result.err().unwrap().kind(), io::ErrorKind::UnexpectedEof);
+
+            std::fs::write(&path, &original).unwrap();
+            let storage = open_file();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(length as u64)
+                .unwrap();
+            let result = Header::load(&storage, false).await;
+            assert_eq!(result.err().unwrap().kind(), io::ErrorKind::UnexpectedEof);
+        }
+        *state.data.lock() = original[..72].to_vec();
+        state.data.lock()[4..8].copy_from_slice(&2u32.to_be_bytes());
+        let storage = MemStorage::new(Arc::clone(&state), false);
+        Header::load(&storage, false).await.unwrap();
+
+        let compressed = miniz_oxide::deflate::compress_to_vec(&[0x5au8; 512], 6);
+        assert!(compressed.len() < 512);
+        let mut compressed_image = original.clone();
+        let l2_offset = read_offset(l1_offset as usize) as usize;
+        compressed_image[l2_offset..l2_offset + 8]
+            .copy_from_slice(&((1u64 << 62) | offset).to_be_bytes());
+        compressed_image[offset as usize..offset as usize + compressed.len()]
+            .copy_from_slice(&compressed);
+        for present in [compressed.len(), 0, 2] {
+            std::fs::write(&path, &compressed_image).unwrap();
+            let storage =
+                crate::file::File::open(StorageOpenOptions::new().filename(&path).write(true))
+                    .await
+                    .unwrap();
+            let qcow2 = Qcow2::<crate::file::File>::builder(storage)
+                .write(true)
+                .open(DenyImplicitOpenGate::default())
+                .await
+                .unwrap();
+            let image = FormatAccess::new(qcow2);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(offset + present as u64)
+                .unwrap();
+            let mut buf = [0xa5u8; 512];
+            let result = image.read(&mut buf[..], 0).await;
+            if present == compressed.len() {
+                result.unwrap();
+                assert_eq!(buf, [0x5a; 512]);
+                image.write(&[0xabu8][..], 32).await.unwrap();
+                image.read(&mut buf[..], 0).await.unwrap();
+                let mut expected = [0x5au8; 512];
+                expected[32] = 0xab;
+                assert_eq!(buf, expected);
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+                assert_eq!(buf, [0xa5; 512]);
+            }
+            image.flush().await.unwrap();
+        }
+    }
+
     /// Load the reftable from storage.
     #[cfg(feature = "async")]
     #[maybe_async]
@@ -821,6 +1270,71 @@ mod tests {
         assert_eq!(offset, discarded_offset);
     }
 
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn discard_preserves_partial_clusters_and_retries_release() {
+        use std::sync::atomic::Ordering;
+
+        for version in [2u32, 3] {
+            for failure in ["sync", "write", "discard"] {
+                let state = Arc::new(MemStorageState::default());
+                let qcow2 = create_image(&state, 4096, 16).await;
+                qcow2.flush().await.unwrap();
+                drop(qcow2);
+                state.data.lock()[4..8].copy_from_slice(&version.to_be_bytes());
+                let qcow2 =
+                    Qcow2::<MemStorage>::builder(MemStorage::new(Arc::clone(&state), false))
+                        .write(true)
+                        .open(DenyImplicitOpenGate::default())
+                        .await
+                        .unwrap();
+                let mut image = FormatAccess::new(qcow2);
+                let mut expected = vec![0x5a; 4096];
+                image.write(&expected[..], 0).await.unwrap();
+                image.flush().await.unwrap();
+                image.sync().await.unwrap();
+                let (Mapping::Raw { offset, .. }, _) = image.get_mapping(512, 512).await.unwrap()
+                else {
+                    panic!("expected data cluster");
+                };
+                match failure {
+                    "sync" => state.fail_next_sync.store(true, Ordering::Relaxed),
+                    "write" => state.fail_next_write.store(true, Ordering::Relaxed),
+                    "discard" => state.fail_next_discard.store(true, Ordering::Relaxed),
+                    _ => unreachable!(),
+                }
+                // Full middle clusters are freed, while both partial clusters are zeroed by COW.
+                let _ = image.discard_to_zero(256, 1024).await;
+                assert!(
+                    state.discarded.lock().is_empty(),
+                    "release before {failure} recovery"
+                );
+                image.discard_to_zero(256, 1024).await.unwrap();
+                image.flush().await.unwrap();
+                image.sync().await.unwrap();
+                expected[256..1280].fill(0);
+                let mut actual = vec![0; 4096];
+                image.read(&mut actual[..], 0).await.unwrap();
+                assert_eq!(actual, expected, "v{version}, {failure}");
+                assert!(state.discarded.lock().contains(&(offset, 512)));
+                image.write(&[0xa5; 512][..], 2048).await.unwrap();
+                image.flush().await.unwrap();
+                image.sync().await.unwrap();
+                expected[2048..2560].fill(0xa5);
+                drop(image);
+                let qcow2 =
+                    Qcow2::<MemStorage>::builder(MemStorage::new(Arc::clone(&state), false))
+                        .open(DenyImplicitOpenGate::default())
+                        .await
+                        .unwrap();
+                FormatAccess::new(qcow2)
+                    .read(&mut actual[..], 0)
+                    .await
+                    .unwrap();
+                assert_eq!(actual, expected, "reopened v{version}, {failure}");
+            }
+        }
+    }
+
     /// Establishing mappings beyond the disk size must fail, also when starting at offset 0.
     #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
     async fn test_mapping_beyond_disk_size() {
@@ -864,12 +1378,18 @@ mod tests {
     /// must leave the range as it was, and free the cluster allocated for it.
     #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
     async fn test_prepare_commit_data_mapping() {
+        fn assert_send<T: Send>() {}
+        assert_send::<PreparedMappingState>();
+        assert_send::<PreparedDataMapping<'static, MemStorage>>();
+
         let state = Arc::new(MemStorageState::default());
         let image = FormatAccess::new(create_image(&state, 64 * 1024, 16).await);
-        let mut buf = [0xffu8; 512];
+        let mut buf = vec![0xffu8; 64 * 1024];
+        let mut expected = vec![0u8; buf.len()];
 
         // Allocate guest cluster 0 (so the L2 table exists)
         image.write(&[0x11u8; 512][..], 0).await.unwrap();
+        expected[..512].fill(0x11);
 
         // Prepare a mapping for guest cluster 1 and write data to it, but then drop it
         let mapping = image.prepare_data_mapping(512, 512, true).await.unwrap();
@@ -882,34 +1402,130 @@ mod tests {
             .await
             .unwrap();
 
-        image.read(&mut buf[..], 512).await.unwrap();
-        assert!(buf == [0u8; 512], "Uncommitted mapping is visible");
+        image.read(&mut buf[..], 0).await.unwrap();
+        assert_eq!(buf, expected, "Uncommitted mapping is visible");
 
-        drop(mapping);
-        image.read(&mut buf[..], 512).await.unwrap();
-        assert!(buf == [0u8; 512], "Dropped mapping is visible");
+        // Cancel on another worker, including releasing the owned L2 write guard there.
+        std::thread::scope(|scope| scope.spawn(move || drop(mapping)).join().unwrap());
+        image.read(&mut buf[..], 0).await.unwrap();
+        assert_eq!(buf, expected, "Dropped mapping is visible");
 
-        // Flushing frees the dropped mapping’s cluster, so preparing a mapping again reuses it;
-        // commit it this time
+        // Flushing frees the dropped mapping's cluster; a failed payload must free it again.
         image.flush().await.unwrap();
         let mapping = image.prepare_data_mapping(512, 512, true).await.unwrap();
         assert!(!mapping.is_nonblocking());
         assert_eq!(mapping.offset(), host_offset);
+        state
+            .fail_next_write
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let err = mapping
+            .storage()
+            .write(&[0x44u8; 512][..], mapping.offset())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(*state.failed.lock(), vec![host_offset]);
+        let prepared_state = mapping.into_state().unwrap();
+        std::thread::spawn(move || drop(prepared_state))
+            .join()
+            .unwrap();
+        image.read(&mut buf[..], 0).await.unwrap();
+        assert_eq!(buf, expected, "Failed payload changed the mapping");
+
+        // Transfer the erased state independently, then reconstruct the mapping and commit it.
+        image.flush().await.unwrap();
+        let mapping = image.prepare_data_mapping(512, 512, true).await.unwrap();
+        assert!(!mapping.is_nonblocking());
+        assert_eq!(mapping.offset(), host_offset);
+        assert_eq!(mapping.length(), 512);
+        let storage = mapping.storage();
+        let length = mapping.length();
+        let prepared_state = mapping.into_state().unwrap();
+        let prepared_state = std::thread::spawn(move || prepared_state).join().unwrap();
+        let mapping = PreparedDataMapping::to_commit(storage, host_offset, length, prepared_state);
         mapping
             .storage()
             .write(&[0x33u8; 512][..], host_offset)
             .await
             .unwrap();
-        image.commit_data_mapping(mapping).await.unwrap();
+        image.read(&mut buf[..], 0).await.unwrap();
+        assert_eq!(
+            buf, expected,
+            "Transferred mapping is visible before commit"
+        );
+        std::thread::scope(|scope| {
+            let image = &image;
+            scope
+                .spawn(move || {
+                    #[cfg(feature = "sync")]
+                    return image.commit_data_mapping(mapping);
+                    #[cfg(feature = "async")]
+                    tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap()
+                        .block_on(image.commit_data_mapping(mapping))
+                })
+                .join()
+                .unwrap()
+        })
+        .unwrap();
 
-        image.read(&mut buf[..], 512).await.unwrap();
-        assert!(buf == [0x33u8; 512], "Committed mapping is not visible");
+        expected[512..1024].fill(0x33);
+        image.read(&mut buf[..], 0).await.unwrap();
+        assert_eq!(buf, expected, "Committed mapping is not visible");
 
         // Now that the cluster is mapped, there is nothing to commit
         let mapping = image.prepare_data_mapping(512, 512, true).await.unwrap();
         assert!(mapping.is_nonblocking());
         assert_eq!(mapping.offset(), host_offset);
         image.commit_data_mapping(mapping).await.unwrap();
+
+        image.flush().await.unwrap();
+        drop(image);
+        let qcow2 = Qcow2::<MemStorage>::builder(MemStorage::new(state, false))
+            .open(DenyImplicitOpenGate::default())
+            .await
+            .unwrap();
+        let image = FormatAccess::new(qcow2);
+        image.read(&mut buf[..], 0).await.unwrap();
+        assert_eq!(buf, expected, "Reopened image lost the committed mapping");
+
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = create_image(&state, 1024 + 128, 16).await;
+        for offset in [123, 1024] {
+            for overwrite in [false, true] {
+                let mapping = qcow2
+                    .prepare_data_mapping(offset, 64, overwrite)
+                    .await
+                    .unwrap();
+                assert_eq!(mapping.length(), 64);
+                drop(mapping);
+            }
+            let mapping = qcow2.prepare_data_mapping(offset, 64, true).await.unwrap();
+            assert_eq!(mapping.length(), 64);
+            mapping
+                .storage()
+                .write(&[0x5au8; 64][..], mapping.offset())
+                .await
+                .unwrap();
+            qcow2.commit_data_mapping(mapping).await.unwrap();
+            let (_, _, length) = qcow2.ensure_data_mapping(offset, 32, true).await.unwrap();
+            assert_eq!(length, 32);
+        }
+        qcow2.flush().await.unwrap();
+        drop(qcow2);
+        let qcow2 = Qcow2::<MemStorage>::builder(MemStorage::new(state, false))
+            .open(DenyImplicitOpenGate::default())
+            .await
+            .unwrap();
+        assert_eq!(qcow2.size(), 1024 + 128);
+        let image = FormatAccess::new(qcow2);
+        for offset in [123, 1024] {
+            let mut buf = [0xffu8; 65];
+            image.read(&mut buf[..], offset).await.unwrap();
+            assert_eq!(&buf[..64], &[0x5a; 64]);
+            assert_eq!(buf[64], 0);
+        }
     }
 
     /// A prepared data mapping must be rejected by an image it does not belong to (and discarded).
@@ -943,11 +1559,10 @@ mod tests {
         u64::from_be_bytes(data[offset..offset + 8].try_into().unwrap())
     }
 
-    /// If a flush is dropped before it has written back a modified L2 table, the table must still
-    /// be considered modified, so that a later flush writes it.
+    /// Cancellation after entering a table write-back rejects retry, even before I/O submission.
     #[cfg(feature = "async")]
     #[tokio::test]
-    async fn test_dropped_l2_writeback_keeps_table_modified() {
+    async fn test_dropped_l2_writeback_rejects_retry() {
         use crate::StorageExt;
         use futures::FutureExt;
 
@@ -962,7 +1577,6 @@ mod tests {
 
         // Modify the L2 table: Map guest cluster 1
         let mapping = qcow2.prepare_data_mapping(512, 512, true).await.unwrap();
-        let host_offset = mapping.offset();
         qcow2.commit_data_mapping(mapping).await.unwrap();
 
         let l2_offset = {
@@ -979,21 +1593,15 @@ mod tests {
         assert!(qcow2.flush().now_or_never().is_none());
         drop(blocker);
 
-        // A later flush must write the L2 table
-        qcow2.flush().await.unwrap();
-        let entry = read_u64(&state, l2_offset + 8);
-        assert_eq!(
-            entry & 0x00ff_ffff_ffff_fe00,
-            host_offset,
-            "mapping guest cluster 1 lost on disk (L2 entry {entry:#x})"
-        );
+        qcow2.flush().await.unwrap_err();
+        qcow2.header.ensure_healthy().unwrap_err();
+        assert_eq!(read_u64(&state, l2_offset + 8), 0);
     }
 
-    /// If a flush is dropped before it has written back a modified refblock, the refblock must
-    /// still be considered modified, so that a later flush writes it.
+    /// Cancellation after entering a refblock write-back also rejects retry.
     #[cfg(feature = "async")]
     #[tokio::test]
-    async fn test_dropped_refblock_writeback_keeps_block_modified() {
+    async fn test_dropped_refblock_writeback_rejects_retry() {
         use crate::StorageExt;
         use futures::FutureExt;
 
@@ -1026,8 +1634,8 @@ mod tests {
         assert!(qcow2.flush().now_or_never().is_none());
         drop(blocker);
 
-        // A later flush must write the refblock
-        qcow2.flush().await.unwrap();
+        qcow2.flush().await.unwrap_err();
+        qcow2.header.ensure_healthy().unwrap_err();
         let refcount_offset =
             (rb_offset + (host_cluster.rb_index(rb_bits) * refcount_bytes) as u64) as usize;
         let data = state.data.lock();
@@ -1036,9 +1644,6 @@ mod tests {
                 .try_into()
                 .unwrap(),
         );
-        assert_eq!(
-            refcount, 1,
-            "refcount increment for {host_cluster:?} lost on disk"
-        );
+        assert_eq!(refcount, 0);
     }
 }
