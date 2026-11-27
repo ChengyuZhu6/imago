@@ -104,7 +104,7 @@ impl<S: Storage> AsyncLruCacheBackend for RefBlockCacheBackend<S> {
 
     async fn flush(&self, rb_cluster: HostCluster, refblock: &RefBlock) -> io::Result<()> {
         refblock
-            .write_if_modified(self.file.as_ref(), rb_cluster)
+            .write_if_modified(self.file.as_ref(), &self.header, rb_cluster)
             .await
     }
 
