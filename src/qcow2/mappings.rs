@@ -192,8 +192,11 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             clusters_to_free: _,
         } = state;
 
+        let generation = self.caches.payload.register();
         for (l2_index, host_cluster, new_allocation) in l2_changes {
-            if let Some(leaked) = l2_table.map_cluster(l2_index, host_cluster, new_allocation) {
+            if let Some(leaked) =
+                l2_table.map_cluster(l2_index, host_cluster, new_allocation, generation)
+            {
                 self.clusters_to_free.push(leaked);
             }
         }
@@ -349,6 +352,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             .write_if_modified(
                 self.metadata.as_ref(),
                 self.storage(),
+                &self.caches.payload,
                 &self.header,
                 l2_allocation.cluster(),
             )

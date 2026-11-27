@@ -86,8 +86,8 @@ async fn l2_eviction_retries_payload_dependency() -> io::Result<()> {
                 .iter()
                 .filter(|event| matches!(event, StorageEvent::Sync))
                 .count(),
-            1,
-            "eviction retry must retain and batch the payload dependency"
+            usize::from(failure == "sync"),
+            "retry must reuse a successful payload sync or repeat a failed one"
         );
         assert_ne!(
             &metadata.data.lock()[l2_offset as usize..l2_offset as usize + 8],

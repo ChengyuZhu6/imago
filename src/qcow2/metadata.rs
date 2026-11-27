@@ -1,6 +1,7 @@
 //! Functionality for working with qcow2 metadata.
 
 use super::allocation::{ClustersToFreeEntry, PendingClusters};
+use super::cache::PayloadDurability;
 use super::compressed::CompressedClusterReadGuard;
 use super::types::*;
 use crate::io_buffers::IoBuffer;
@@ -1835,9 +1836,9 @@ pub(super) struct L2Table {
     /// A dropped writeback may still write its snapshot after releasing the lock.
     writeback_cancelled: AtomicBool,
 
-    /// Binds a snapshot to the payload dependency set by mapping commits.
+    /// Binds a snapshot to the highest payload generation set by mapping commits.
     /// Held only while copying entries or modifying them, never across I/O.
-    payload_dependency: parking_lot::Mutex<bool>,
+    payload_dependency: parking_lot::Mutex<u64>,
 }
 
 /// Write guard for an L2 table.
@@ -1917,6 +1918,7 @@ impl L2Table {
         &self,
         image: &S,
         data_file: &S,
+        payload: &PayloadDurability,
         header: &Header,
         cluster: HostCluster,
     ) -> io::Result<()> {
@@ -1940,13 +1942,10 @@ impl L2Table {
         };
         let mut modified = DropGuard::new(|| {
             let mut dependency = self.payload_dependency.lock();
-            *dependency |= depends_on_payload;
+            *dependency = (*dependency).max(depends_on_payload);
             self.set_modified();
         });
-        if depends_on_payload {
-            data_file.flush().await?;
-            data_file.sync().await?;
-        }
+        payload.sync(data_file, depends_on_payload).await?;
         header.ensure_healthy()?;
         let mut cancelled =
             DropGuard::new(|| self.writeback_cancelled.store(true, Ordering::Relaxed));
@@ -1994,6 +1993,7 @@ impl L2TableWriteGuard {
         index: usize,
         host_cluster: HostCluster,
         new_allocation: Option<PendingClusters>,
+        payload_generation: u64,
     ) -> Option<ClustersToFreeEntry> {
         if let Some(new_allocation) = new_allocation.as_ref() {
             debug_assert_eq!(new_allocation.cluster(), host_cluster);
@@ -2007,7 +2007,7 @@ impl L2TableWriteGuard {
             self.table.cluster_bits,
         );
         let mut dependency = self.table.payload_dependency.lock();
-        *dependency = true;
+        *dependency = (*dependency).max(payload_generation);
         // Safe: We set a full valid mapping, and there is only one writer (thanks to
         // `L2TableWriteGuard`).
         let l2e = unsafe { self.table.data[index].swap(new) };

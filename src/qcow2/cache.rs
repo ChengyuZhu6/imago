@@ -2,7 +2,56 @@
 
 use super::*;
 use crate::async_lru_cache::AsyncLruCacheBackend;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::trace;
+
+/// Tracks completed payload commits covered by successful storage barriers.
+#[derive(Debug, Default)]
+pub(super) struct PayloadDurability {
+    /// Highest generation assigned after payload I/O completes, before publishing its mapping.
+    committed: AtomicU64,
+    /// Highest generation captured before a successful payload storage flush and sync.
+    durable: AtomicU64,
+    /// Coalesces concurrent L2 writeback barriers without blocking mapping commits.
+    sync_lock: Mutex<()>,
+}
+
+#[maybe_async]
+impl PayloadDurability {
+    /// Register a completed payload write before publishing its L2 mapping.
+    pub fn register(&self) -> u64 {
+        let previous = self
+            .committed
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                Some(value.saturating_add(1))
+            })
+            .unwrap();
+        previous.saturating_add(1)
+    }
+
+    /// Capture only commits which precede the upcoming storage barrier.
+    fn generation(&self) -> u64 {
+        self.committed.load(Ordering::Acquire)
+    }
+
+    /// Credit a completed barrier. Saturated generations always require another barrier.
+    fn mark_durable(&self, generation: u64) {
+        self.durable
+            .fetch_max(generation.min(u64::MAX - 1), Ordering::Release);
+    }
+
+    /// Make a snapshot's payload dependency durable, sharing completed barriers across tables.
+    pub async fn sync<S: Storage>(&self, file: &S, dependency: u64) -> io::Result<()> {
+        let _lock = self.sync_lock.lock().await;
+        if dependency > self.durable.load(Ordering::Acquire) {
+            let generation = self.generation();
+            file.flush().await?;
+            file.sync().await?;
+            self.mark_durable(generation);
+        }
+        Ok(())
+    }
+}
 
 /// I/O back-end for the L2 table cache.
 struct L2CacheBackend<S: Storage> {
@@ -14,6 +63,9 @@ struct L2CacheBackend<S: Storage> {
 
     /// Payload storage, updated when the image's dependencies are opened.
     data_file: Arc<parking_lot::RwLock<Arc<S>>>,
+
+    /// Shared payload durability generations.
+    payload: Arc<PayloadDurability>,
 }
 
 /// I/O back-end for the refblock cache.
@@ -31,11 +83,13 @@ impl<S: Storage> L2CacheBackend<S> {
         file: Arc<S>,
         header: Arc<Header>,
         data_file: Arc<parking_lot::RwLock<Arc<S>>>,
+        payload: Arc<PayloadDurability>,
     ) -> Self {
         L2CacheBackend {
             file,
             header,
             data_file,
+            payload,
         }
     }
 }
@@ -75,6 +129,7 @@ impl<S: Storage> AsyncLruCacheBackend for L2CacheBackend<S> {
             .write_if_modified(
                 self.file.as_ref(),
                 data_file.as_ref(),
+                &self.payload,
                 &self.header,
                 l2_cluster,
             )
@@ -158,6 +213,9 @@ pub(super) struct MetadataCaches<S: Storage> {
     /// Shared with L2 writeback so eviction flushes the actual payload storage.
     data_file: Arc<parking_lot::RwLock<Arc<S>>>,
 
+    /// Durability of completed payload commits.
+    pub(super) payload: Arc<PayloadDurability>,
+
     /// L2 table cache
     l2: AsyncLruCache<HostCluster, L2Table, L2CacheBackend<S>>,
 
@@ -180,13 +238,19 @@ impl<S: Storage> MetadataCaches<S> {
     /// `rb_entries` refcount blocks.
     pub fn new(file: &Arc<S>, header: &Arc<Header>, l2_entries: usize, rb_entries: usize) -> Self {
         let data_file = Arc::new(parking_lot::RwLock::new(Arc::clone(file)));
-        let l2_backend =
-            L2CacheBackend::new(Arc::clone(file), Arc::clone(header), Arc::clone(&data_file));
+        let payload = Arc::new(PayloadDurability::default());
+        let l2_backend = L2CacheBackend::new(
+            Arc::clone(file),
+            Arc::clone(header),
+            Arc::clone(&data_file),
+            Arc::clone(&payload),
+        );
         let rb_backend = RefBlockCacheBackend::new(Arc::clone(file), Arc::clone(header));
 
         MetadataCaches {
             file: Arc::clone(file),
             data_file,
+            payload,
             l2: AsyncLruCache::new(l2_backend, l2_entries),
             rb: AsyncLruCache::new(rb_backend, rb_entries),
             direction: Default::default(),
@@ -196,6 +260,19 @@ impl<S: Storage> MetadataCaches<S> {
     /// Update the payload storage used by cached L2 writebacks.
     pub fn set_data_file(&self, file: Option<Arc<S>>) {
         *self.data_file.write() = file.unwrap_or_else(|| Arc::clone(&self.file));
+        self.payload.durable.store(0, Ordering::Release);
+    }
+
+    /// Persist metadata and credit payload commits only when they use the same storage.
+    async fn sync_metadata(&self) -> io::Result<()> {
+        let generation = self.payload.generation();
+        let data_file = self.data_file.read().clone();
+        self.file.flush().await?;
+        self.file.sync().await?;
+        if Arc::ptr_eq(&self.file, &data_file) {
+            self.payload.mark_durable(generation);
+        }
+        Ok(())
     }
 
     /// Make sure the refblock cache is flushed before the L2 cache.
@@ -205,8 +282,7 @@ impl<S: Storage> MetadataCaches<S> {
         let mut dir = self.direction.write().await;
         if *dir == CacheDependency::RbDependsOnL2 {
             self.l2.flush().await?;
-            self.file.flush().await?;
-            self.file.sync().await?;
+            self.sync_metadata().await?;
         }
         *dir = CacheDependency::L2DependsOnRb;
         Ok(())
@@ -219,8 +295,7 @@ impl<S: Storage> MetadataCaches<S> {
         let mut dir = self.direction.write().await;
         if *dir == CacheDependency::L2DependsOnRb {
             self.rb.flush().await?;
-            self.file.flush().await?;
-            self.file.sync().await?;
+            self.sync_metadata().await?;
         }
         *dir = CacheDependency::RbDependsOnL2;
         Ok(())
@@ -231,12 +306,10 @@ impl<S: Storage> MetadataCaches<S> {
         let direction = self.direction.read().await;
         if *direction == CacheDependency::L2DependsOnRb {
             self.rb.flush().await?;
-            self.file.flush().await?;
-            self.file.sync().await?;
+            self.sync_metadata().await?;
         }
         self.l2.flush().await?;
-        self.file.flush().await?;
-        self.file.sync().await
+        self.sync_metadata().await
     }
 
     /// Flush both L2 and refblock cache to disk.
@@ -244,14 +317,12 @@ impl<S: Storage> MetadataCaches<S> {
         let dir = self.direction.read().await;
         if *dir == CacheDependency::L2DependsOnRb {
             self.rb.flush().await?;
-            self.file.flush().await?;
-            self.file.sync().await?;
+            self.sync_metadata().await?;
             self.l2.flush().await?;
         } else {
             self.l2.flush().await?;
             if *dir == CacheDependency::RbDependsOnL2 {
-                self.file.flush().await?;
-                self.file.sync().await?;
+                self.sync_metadata().await?;
             }
             self.rb.flush().await?;
         }
@@ -270,8 +341,7 @@ impl<S: Storage> MetadataCaches<S> {
 
         if *dir == CacheDependency::L2DependsOnRb {
             self.rb.flush().await?;
-            self.file.flush().await?;
-            self.file.sync().await?;
+            self.sync_metadata().await?;
         }
 
         // `unwrap()` is safe: Will never return `Ok(None)` with `may_flush` set to true.
@@ -292,8 +362,7 @@ impl<S: Storage> MetadataCaches<S> {
         if !self.l2.insert(cluster, Arc::clone(&table), false).await? {
             if *dir == CacheDependency::L2DependsOnRb {
                 self.rb.flush().await?;
-                self.file.flush().await?;
-                self.file.sync().await?;
+                self.sync_metadata().await?;
             }
 
             let inserted = self.l2.insert(cluster, table, true).await?;
@@ -323,8 +392,7 @@ impl<S: Storage> MetadataCaches<S> {
 
         if *dir == CacheDependency::RbDependsOnL2 {
             self.l2.flush().await?;
-            self.file.flush().await?;
-            self.file.sync().await?;
+            self.sync_metadata().await?;
         }
 
         // `unwrap()` is safe: Will never return `Ok(None)` with `may_flush` set to true.
@@ -345,8 +413,7 @@ impl<S: Storage> MetadataCaches<S> {
         if !self.rb.insert(cluster, Arc::clone(&rb), false).await? {
             if *dir == CacheDependency::RbDependsOnL2 {
                 self.l2.flush().await?;
-                self.file.flush().await?;
-                self.file.sync().await?;
+                self.sync_metadata().await?;
             }
 
             let inserted = self.rb.insert(cluster, rb, true).await?;
@@ -362,12 +429,10 @@ impl<S: Storage> MetadataCaches<S> {
         let dir = self.direction.read().await;
         if *dir == CacheDependency::RbDependsOnL2 {
             self.l2.flush().await?;
-            self.file.flush().await?;
-            self.file.sync().await?;
+            self.sync_metadata().await?;
         }
         self.rb.flush().await?;
-        self.file.flush().await?;
-        self.file.sync().await
+        self.sync_metadata().await
     }
 
     /// Invalidate the refblock cache.
