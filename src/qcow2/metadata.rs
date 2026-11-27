@@ -3208,6 +3208,8 @@ fn decode_binary<T: OnDiskStruct>(slice: &[u8]) -> io::Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "async")]
+    use crate::test::mem_storage::create_image;
     use crate::test::mem_storage::{MemStorage, MemStorageState};
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -3359,6 +3361,94 @@ mod tests {
                 let reopened = Header::load(&image).await?;
                 assert_eq!(reopened.size(), 0);
             }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn l2_writeback_binds_payload_dependency_to_snapshot() -> io::Result<()> {
+        use crate::test::mem_storage::StorageEvent;
+        use crate::FormatAccess;
+        use std::task::Poll;
+
+        for cancel in [false, true] {
+            let state = Arc::new(MemStorageState::default());
+            let qcow2 = create_image(&state, 32768).await;
+            let l2 = qcow2.ensure_l2(GuestOffset(0)).await?;
+            let l2_offset = l2.get_offset().unwrap().0;
+            let caches = Arc::clone(&qcow2.caches);
+            let image = FormatAccess::new(qcow2);
+            image.flush().await?;
+            image.sync().await?;
+            image.write(&[0x11; 512][..], 0).await?;
+            // Prepare the next mapping before flush holds the cache direction lock.
+            state.hold_writes.store(true, Ordering::Relaxed);
+            let mut write = Box::pin(image.write(&[0x33; 512][..], 512));
+            assert!(crate::test::mem_storage::poll_once(write.as_mut()).is_pending());
+            assert_eq!(state.held.lock().len(), 1);
+            state.hold_writes.store(false, Ordering::Relaxed);
+            caches.rb_depends_on_l2().await?;
+
+            state.hold_next_sync.store(true, Ordering::Relaxed);
+            let mut flush = Box::pin(image.flush());
+            assert!(crate::test::mem_storage::poll_once(flush.as_mut()).is_pending());
+            assert!(
+                !l2.is_modified(),
+                "writeback must snapshot before its payload barrier"
+            );
+            state.release_held_writes();
+            let Poll::Ready(result) = crate::test::mem_storage::poll_once(write.as_mut()) else {
+                panic!("commit waited for writeback's payload barrier");
+            };
+            result.unwrap();
+            drop(write);
+            assert!(l2.is_modified());
+            state.release_sync.store(true, Ordering::Relaxed);
+            flush.await?;
+            assert_eq!(
+                &state.data.lock()[l2_offset as usize + 8..l2_offset as usize + 16],
+                &[0; 8],
+                "snapshot included a later commit"
+            );
+            assert!(l2.is_modified(), "later commit lost its dirty state");
+
+            *state.events.lock() = Some(Vec::new());
+            if cancel {
+                state.release_sync.store(false, Ordering::Relaxed);
+                state.hold_next_sync.store(true, Ordering::Relaxed);
+                let mut flush = Box::pin(image.flush());
+                assert!(crate::test::mem_storage::poll_once(flush.as_mut()).is_pending());
+                assert!(!l2.is_modified());
+                drop(flush);
+                state.release_sync.store(true, Ordering::Relaxed);
+            } else {
+                state.fail_next_sync.store(true, Ordering::Relaxed);
+                assert!(image.flush().await.is_err());
+            }
+            assert!(l2.is_modified());
+            assert_eq!(
+                &state.data.lock()[l2_offset as usize + 8..l2_offset as usize + 16],
+                &[0; 8],
+                "failed payload barrier published its mapping"
+            );
+            *state.events.lock() = Some(Vec::new());
+            image.flush().await?;
+            let events = state.events.lock().take().unwrap();
+            let barrier = events
+                .iter()
+                .position(|event| matches!(event, StorageEvent::Sync))
+                .unwrap();
+            let publication = events
+                .iter()
+                .position(|event| {
+                    matches!(event,
+                StorageEvent::Write(offset, _) if *offset == l2_offset)
+                })
+                .unwrap();
+            assert!(barrier < publication, "retry lost the payload dependency");
+            assert!(!l2.is_modified());
+            image.sync().await?;
         }
         Ok(())
     }
