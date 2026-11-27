@@ -302,7 +302,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             return Ok(l2);
         }
 
-        self.need_writable()?;
+        self.prepare_write().await?;
 
         let mut l1_locked = self.l1_table.write().await;
         let l1_index = offset.l1_index(cb);

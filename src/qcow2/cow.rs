@@ -80,7 +80,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             }));
         };
 
-        self.need_writable()?;
+        self.prepare_write().await?;
 
         // New cluster index, and, if newly allocated, a `PendingClusters` guard
         let new_cluster: Option<(HostCluster, Option<PendingClusters>)> = if let L2Mapping::Zero {
