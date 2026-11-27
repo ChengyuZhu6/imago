@@ -190,9 +190,10 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         Self::do_open(metadata, writable, StorageOpenOptions::new()).await
     }
 
-
-
-    /// Check active metadata ownership without modifying the image.
+    /// Validate active metadata overlaps, allocation ownership and COPIED flags.
+    ///
+    /// Requires a writable image without an external data file. Does not modify the image.
+    /// This checks active references only, not inactive snapshot metadata.
     pub async fn validate_active_metadata(&self) -> io::Result<()> {
         self.need_writable()?;
         if self.requires_external_data_file() {
@@ -257,7 +258,17 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         self.backing_set = true;
     }
 
-
+    /// Enable physical discard of released data clusters. Disabled by default.
+    ///
+    /// This adds storage I/O when clusters are released, including COW replacements.
+    /// Completed discard errors are best-effort and do not prevent freeing the cluster.
+    /// Cancelling an in-flight discard can leak clusters until the image is repaired,
+    /// keeping them unavailable for reuse while the discard may still complete.
+    pub fn set_discard_passthrough(&mut self, enabled: bool) {
+        if let Some(allocator) = self.allocator.as_mut() {
+            allocator.get_mut().discard_passthrough = enabled;
+        }
+    }
 
     /// Get the data storage object.
     ///

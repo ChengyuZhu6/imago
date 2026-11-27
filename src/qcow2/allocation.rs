@@ -119,6 +119,8 @@ impl ClustersToFreeEntry {
 
 /// Central facility for cluster allocation.
 pub(super) struct Allocator<S: Storage> {
+    /// Pass released data clusters through to storage discard when explicitly enabled.
+    pub(super) discard_passthrough: bool,
     /// Qcow2 metadata file.
     file: Arc<S>,
 
@@ -302,6 +304,7 @@ impl<S: Storage> Allocator<S> {
         .await?;
 
         Ok(Allocator {
+            discard_passthrough: false,
             file: image,
             reftable,
             first_free_cluster: HostCluster(0),
@@ -311,9 +314,7 @@ impl<S: Storage> Allocator<S> {
         })
     }
 
-
-
-    /// Validate active references before enabling writes.
+    /// Validate active metadata, allocation ownership and COPIED bits before enabling writes.
     pub async fn validate_active_metadata(&mut self, l1: &L1Table) -> io::Result<()> {
         let cb = self.header.cluster_bits();
         let mut l2_clusters: Vec<_> = (0..l1.entries())
@@ -428,6 +429,9 @@ impl<S: Storage> Allocator<S> {
     /// Best-effort operation.  On error, the given clusters may be leaked, but no errors are ever
     /// returned (because there is no good way to handle such errors anyway).
     async fn process_clusters_to_free(&mut self) {
+        if self.header.ensure_healthy().is_err() {
+            return;
+        }
         let (metadata_clusters, mut data_clusters): (Vec<_>, Vec<_>) = self
             .clusters_to_free
             .take()
@@ -452,26 +456,61 @@ impl<S: Storage> Allocator<S> {
         // In any case, all of these clusters will be in the qcow2 (metadata) file, because data
         // clusters in external data files do not need this treatment.
         if let Err(err) = self.file.settle_writes().await {
-            warn!("Leaking clusters; cannot settle writes: {err}");
+            warn!("Deferring cluster release; cannot settle writes: {err}");
+            for entry in metadata_clusters.into_iter().chain(data_clusters) {
+                self.clusters_to_free.push(entry);
+            }
             return;
         }
 
+        if !metadata_clusters.is_empty() {
+            // Old L1/L2/reftable references must be durable before their clusters are reusable.
+            let result = match self.file.flush().await {
+                Ok(()) => self.file.sync().await,
+                Err(err) => Err(err),
+            };
+            if let Err(err) = result {
+                warn!("Deferring cluster release; cannot persist metadata pointers: {err}");
+                for entry in metadata_clusters.into_iter().chain(data_clusters) {
+                    self.clusters_to_free.push(entry);
+                }
+                return;
+            }
+        }
         for entry in metadata_clusters {
-            self.free_clusters(entry.first_cluster, entry.count).await;
+            self.free_clusters(entry.first_cluster, entry.count, false)
+                .await;
         }
 
         if data_clusters.is_empty() {
             return;
         }
 
-        // Clear L2 entries before deallocating data clusters
-        if let Err(err) = self.caches.rb_depends_on_l2().await {
-            warn!("Leaking clusters; cannot set up cache dependency: {err}");
+        // Removed mappings must be durable before their data can be punched out.
+        let prepare = match self.caches.rb_depends_on_l2().await {
+            Ok(()) => self.caches.flush_l2().await,
+            Err(err) => Err(err),
+        };
+        if let Err(err) = prepare {
+            warn!("Cannot persist removed mappings; deferring data cluster release: {err}");
+            for entry in data_clusters {
+                self.clusters_to_free.push(entry);
+            }
             return;
         }
 
-        for entry in data_clusters {
-            self.free_clusters(entry.first_cluster, entry.count).await;
+        // Adjacent small clusters must reach the host's discard alignment together.
+        data_clusters.sort_unstable_by_key(|entry| entry.first_cluster);
+        let mut entries = data_clusters.into_iter().peekable();
+        while let Some(mut entry) = entries.next() {
+            while entries
+                .peek()
+                .is_some_and(|next| entry.first_cluster + entry.count == next.first_cluster)
+            {
+                entry.count += entries.next().unwrap().count;
+            }
+            self.free_clusters(entry.first_cluster, entry.count, self.discard_passthrough)
+                .await;
         }
     }
 
@@ -574,7 +613,7 @@ impl<S: Storage> Allocator<S> {
                 // Already allocated, or some real error occurred; free everything allocated so far.
                 // Do not go through `self.clusters_to_free`: As described above, the freed range
                 // must be available for allocation immediately, so that retrying converges.
-                self.free_clusters(start_index, index - start_index)
+                self.free_clusters(start_index, index - start_index, false)
                     .await;
                 return result.map(|_| index - start_index);
             }
@@ -858,8 +897,13 @@ impl<S: Storage> Allocator<S> {
     ///
     /// Best-effort operation.  On error, the given clusters may be leaked, but no errors are ever
     /// returned (because there is no good way to handle such errors anyway).
-    async fn free_clusters(&mut self, start: HostCluster, mut count: ClusterCount) {
-        if count.0 == 0 {
+    async fn free_clusters(
+        &mut self,
+        mut start: HostCluster,
+        mut count: ClusterCount,
+        discard: bool,
+    ) {
+        if count.0 == 0 || self.header.ensure_healthy().is_err() {
             return;
         }
 
@@ -875,12 +919,40 @@ impl<S: Storage> Allocator<S> {
             let in_rb_count = cmp::min((rb_entries - rb_index) as u64, count.0) as usize;
 
             match self.get_rb(rt_index).await {
-                Ok(Some(rb)) => {
-                    let mut rb = rb.lock_write().await;
-                    for i in rb_index..(rb_index + in_rb_count) {
+                Ok(Some(refblock)) => {
+                    let mut rb = refblock.lock_write().await;
+                    if self.header.ensure_healthy().is_err() {
+                        return;
+                    }
+                    let end = rb_index + in_rb_count;
+                    let mut i = rb_index;
+                    while i < end {
+                        if discard && refblock.get(i) == 1 {
+                            let cluster = start + ClusterCount((i - rb_index) as u64);
+                            let offset = cluster.offset(self.header.cluster_bits());
+                            let first = i;
+                            while i < end && refblock.get(i) == 1 {
+                                i += 1;
+                            }
+                            let count = ClusterCount((i - first) as u64);
+                            // Keep the last reference until discard completes: cancellation must
+                            // not let an in-flight discard target a subsequently reused cluster.
+                            if let Err(err) = self
+                                .file
+                                .discard(offset.0, count.byte_size(self.header.cluster_bits()))
+                                .await
+                            {
+                                warn!("Cannot reclaim data cluster at {offset:?}: {err}");
+                            }
+                            for index in first..i {
+                                rb.decrement(index).unwrap();
+                            }
+                            continue;
+                        }
                         if let Err(err) = rb.decrement(i) {
                             event!(Level::WARN, "Failed to free cluster: {err}");
                         }
+                        i += 1;
                     }
                 }
 
@@ -890,10 +962,17 @@ impl<S: Storage> Allocator<S> {
                         "Failed to free {in_rb_count} clusters: Not allocated"
                     )
                 }
-                Err(err) => event!(Level::WARN, "Failed to free {in_rb_count} clusters: {err}"),
+                Err(err) => {
+                    event!(Level::WARN, "Failed to free {in_rb_count} clusters: {err}");
+                    let mut entry =
+                        ClustersToFreeEntry::data(start, ClusterCount(in_rb_count as u64));
+                    entry.metadata = !discard;
+                    self.clusters_to_free.push(entry);
+                }
             }
 
             count -= ClusterCount(in_rb_count as u64);
+            start += ClusterCount(in_rb_count as u64);
             rb_index = 0;
             rt_index += 1;
         }
@@ -1000,6 +1079,7 @@ mod tests {
         let old_reftable = RefTable::from_data(data.into_boxed_slice(), &header);
 
         let mut allocator = Allocator {
+            discard_passthrough: false,
             file: Arc::clone(&null),
             reftable: old_reftable,
             first_free_cluster: rb_a_cluster,
