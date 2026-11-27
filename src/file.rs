@@ -494,16 +494,14 @@ impl File {
                 writable,
             )
         } else {
-            // Buffered I/O has no request/memory alignment (page cache).
-            // Write-zeroes/discard still need the filesystem block size when
-            // writable; read-only files never issue those operations.
-            #[cfg(unix)]
+            // Linux buffered I/O also supports byte ranges for zeroing and hole punching.
+            #[cfg(all(unix, not(target_os = "linux")))]
             let (zero_align, discard_align) = if writable {
                 Self::get_fs_zero_discard_align(&file)
             } else {
                 (1, 1)
             };
-            #[cfg(not(unix))]
+            #[cfg(any(target_os = "linux", not(unix)))]
             let (zero_align, discard_align) = (1, 1);
             (1, 1, zero_align, discard_align)
         };
@@ -1174,7 +1172,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::{cmp, env, fs, io};
 
-    #[cfg(windows)]
+    #[cfg(any(target_os = "linux", windows))]
     #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
     async fn zero_data_preserves_the_byte_at_the_exclusive_end() {
         let path = test_dir().join(format!(
@@ -1192,7 +1190,7 @@ mod tests {
             .open(&path)
             .unwrap();
         let storage = File::try_from(host).unwrap();
-        let zero_result = storage.discard_to_zero_os_specific(4096, 4096).await;
+        let zero_result = storage.discard_to_zero_os_specific(13, 8192 - 26).await;
         drop(storage);
 
         let contents = fs::read(&path);
@@ -1206,9 +1204,10 @@ mod tests {
         }
         zero_result.unwrap();
         let contents = contents.unwrap();
-        assert_eq!(contents[4095], 0x5a);
-        assert!(contents[4096..8192].iter().all(|byte| *byte == 0));
-        assert_eq!(contents[8192], 0x5a);
+        assert!(contents[..13].iter().all(|byte| *byte == 0x5a));
+        assert!(contents[13..8179].iter().all(|byte| *byte == 0));
+        assert!(contents[8179..].iter().all(|byte| *byte == 0x5a));
+        assert_eq!(contents.len(), 12288);
     }
 
     #[cfg(windows)]
@@ -1254,6 +1253,9 @@ mod tests {
             storage.discard_align,
         );
         let len = fs::metadata(&path).unwrap().len();
+        #[cfg(target_os = "linux")]
+        let expected_fs_align = (1, 1);
+        #[cfg(not(target_os = "linux"))]
         let expected_fs_align = {
             let probe = fs::File::open(&path).unwrap();
             super::File::get_fs_zero_discard_align(&probe)
@@ -1391,7 +1393,6 @@ mod tests {
     }
 
     /// Reading past the actual end of file must work even if `File::size` is larger.
-    #[cfg(windows)]
     #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
     async fn read_past_external_truncation() -> io::Result<()> {
         use crate::StorageOpenOptions;
@@ -1406,12 +1407,15 @@ mod tests {
         let _temp_path = TempPath(path.clone());
         std::fs::write(&path, vec![0xabu8; 8192])?;
 
-        let file = File::open(StorageOpenOptions::new().filename(&path)).await?;
+        let mut file = File::open(StorageOpenOptions::new().filename(&path)).await?;
         // Truncate behind `file`'s back, so its cached size is too large
         fs::OpenOptions::new()
             .write(true)
             .open(&path)?
-            .set_len(4096)?;
+            .set_len(5000)?;
+        assert_eq!(file.size()?, 8192);
+        file.req_align = 512;
+        file.mem_align = 512;
 
         // When broken, reading spins forever; abort instead of hanging
         let done = Arc::new(AtomicBool::new(false));
@@ -1426,10 +1430,11 @@ mod tests {
 
         let mut buf = vec![0xffu8; 8192];
         file.read(&mut buf[..], 0).await?;
-        done.store(true, Ordering::Relaxed);
+        assert!(buf[..5000].iter().all(|&byte| byte == 0xab));
+        assert!(buf[5000..].iter().all(|&byte| byte == 0));
 
-        assert!(buf[..4096].iter().all(|&byte| byte == 0xab));
-        assert!(buf[4096..].iter().all(|&byte| byte == 0));
+        assert_eq!(file.size()?, 8192);
+        done.store(true, Ordering::Relaxed);
 
         io::Result::Ok(())
     }
