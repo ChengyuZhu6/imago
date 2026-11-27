@@ -358,6 +358,13 @@ impl Header {
         if header.magic != MAGIC {
             return Err(invalid_data("Not a qcow2 file"));
         }
+        if header.crypt_method != 0 {
+            return Err(invalid_data(format!(
+                "qcow2 encryption method {} is not supported",
+                header.crypt_method
+            )));
+        }
+
         let v3header_base = if header.version == 2 {
             V3HeaderBase::default()
         } else if header.version == 3 {
@@ -410,6 +417,18 @@ impl Header {
         l1_offset
             .checked_cluster(header.cluster_bits)
             .ok_or_else(|| invalid_data(format!("Unaligned L1 table: {l1_offset}")))?;
+
+        let l1_entries = header.l1_size.load(Ordering::Relaxed) as usize;
+        let required_l1_entries = header
+            .size
+            .load(Ordering::Relaxed)
+            .div_ceil(1u64 << (2 * header.cluster_bits - 3));
+        if l1_entries > L1Table::MAX_ENTRIES || (l1_entries as u64) < required_l1_entries {
+            return Err(invalid_data(format!(
+                "Invalid L1 table size: {l1_entries} entries, need at least {required_l1_entries} and permit at most {}",
+                L1Table::MAX_ENTRIES,
+            )));
+        }
 
         let rt_offset = HostOffset(header.refcount_table_offset.load(Ordering::Relaxed));
         rt_offset
@@ -1059,8 +1078,14 @@ impl HeaderExtension {
                     HeaderExtension::BackingFileFormat(fmt)
                 }
                 HeaderExtensionType::FeatureNameTable => {
+                    if !data.len().is_multiple_of(48) {
+                        return Err(invalid_data(format!(
+                            "Invalid feature name table length: {}",
+                            data.len()
+                        )));
+                    }
                     let mut feats = HashMap::new();
-                    for feat in data.chunks(48) {
+                    for feat in data.chunks_exact(48) {
                         let feat_type: FeatureType = match feat[0].try_into() {
                             Ok(ft) => ft,
                             Err(_) => continue, // skip unrecognized entries
