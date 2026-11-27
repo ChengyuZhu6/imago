@@ -89,7 +89,10 @@ I/O to finish and verify image consistency before reopening. Unpublished allocat
 and cancelled physical discards can leave leaked clusters that require repair.
 
 New L2 mappings are written after their payload and allocation refcounts are durable,
-including cache eviction. This can add storage synchronization during allocating
+including cache eviction. Successful same-file metadata barriers cover payload commits
+registered before the barrier starts. L2 writebacks share that completed barrier,
+or a payload-only barrier for external data files. Later commits retain their own
+dependency. Failed or cancelled barriers do not advance the durable generation. This can add storage synchronization during allocating
 writes. Ordinary writes to existing data mappings use the existing fast path.
 
 Physical discard of released clusters is disabled by default. Call
