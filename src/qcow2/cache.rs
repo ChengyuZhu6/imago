@@ -11,6 +11,9 @@ struct L2CacheBackend<S: Storage> {
 
     /// Qcow2 header.
     header: Arc<Header>,
+
+    /// Payload storage, updated when the image's dependencies are opened.
+    data_file: Arc<parking_lot::RwLock<Arc<S>>>,
 }
 
 /// I/O back-end for the refblock cache.
@@ -23,44 +26,17 @@ struct RefBlockCacheBackend<S: Storage> {
 }
 
 impl<S: Storage> L2CacheBackend<S> {
-    /// Create a new `L2CacheBackend`.
-    ///
-    /// `file` is the qcow2 metadata (image) file.
-    pub fn new(file: Arc<S>, header: Arc<Header>) -> Self {
-        L2CacheBackend { file, header }
-    }
-}
-
-#[maybe_async(AFIT)]
-impl<S: Storage> AsyncLruCacheBackend for L2CacheBackend<S> {
-    type Key = HostCluster;
-    type Value = L2Table;
-
-    async fn load(&self, l2_cluster: HostCluster) -> io::Result<L2Table> {
-        trace!("Loading L2 table");
-
-        L2Table::load(
-            self.file.as_ref(),
-            &self.header,
-            l2_cluster,
-            self.header.l2_entries(),
-        )
-        .await
-    }
-
-    async fn flush(&self, l2_cluster: HostCluster, l2_table: &L2Table) -> io::Result<()> {
-        trace!("Flushing L2 table");
-        l2_table
-            .write_if_modified(self.file.as_ref(), l2_cluster)
-            .await
-    }
-
-    unsafe fn evict(&self, _l2_cluster: HostCluster, l2_table: L2Table) {
-        trace!(
-            "Evicting L2 table {}",
-            l2_table.get_offset().unwrap_or(HostOffset(0))
-        );
-        l2_table.clear_modified();
+    /// Create a new `L2CacheBackend` for the metadata and payload storage.
+    pub fn new(
+        file: Arc<S>,
+        header: Arc<Header>,
+        data_file: Arc<parking_lot::RwLock<Arc<S>>>,
+    ) -> Self {
+        L2CacheBackend {
+            file,
+            header,
+            data_file,
+        }
     }
 }
 
@@ -74,12 +50,56 @@ impl<S: Storage> RefBlockCacheBackend<S> {
 }
 
 #[maybe_async(AFIT)]
+impl<S: Storage> AsyncLruCacheBackend for L2CacheBackend<S> {
+    type Key = HostCluster;
+    type Value = L2Table;
+
+    async fn load(&self, l2_cluster: HostCluster) -> io::Result<L2Table> {
+        trace!("Loading L2 table");
+        self.header.ensure_healthy()?;
+        let table = L2Table::load(
+            self.file.as_ref(),
+            &self.header,
+            l2_cluster,
+            self.header.l2_entries(),
+        )
+        .await?;
+        self.header.ensure_healthy()?;
+        Ok(table)
+    }
+
+    async fn flush(&self, l2_cluster: HostCluster, l2_table: &L2Table) -> io::Result<()> {
+        trace!("Flushing L2 table");
+        let data_file = self.data_file.read().clone();
+        l2_table
+            .write_if_modified(
+                self.file.as_ref(),
+                data_file.as_ref(),
+                &self.header,
+                l2_cluster,
+            )
+            .await
+    }
+
+    unsafe fn evict(&self, _l2_cluster: HostCluster, l2_table: L2Table) {
+        trace!(
+            "Evicting L2 table {}",
+            l2_table.get_offset().unwrap_or(HostOffset(0))
+        );
+        l2_table.clear_modified();
+    }
+}
+
+#[maybe_async(AFIT)]
 impl<S: Storage> AsyncLruCacheBackend for RefBlockCacheBackend<S> {
     type Key = HostCluster;
     type Value = RefBlock;
 
     async fn load(&self, rb_cluster: HostCluster) -> io::Result<RefBlock> {
-        RefBlock::load(self.file.as_ref(), &self.header, rb_cluster).await
+        self.header.ensure_healthy()?;
+        let block = RefBlock::load(self.file.as_ref(), &self.header, rb_cluster).await?;
+        self.header.ensure_healthy()?;
+        Ok(block)
     }
 
     async fn flush(&self, rb_cluster: HostCluster, refblock: &RefBlock) -> io::Result<()> {
@@ -135,6 +155,9 @@ pub(super) struct MetadataCaches<S: Storage> {
     /// Backing storage for durability barriers between dependent metadata writes.
     file: Arc<S>,
 
+    /// Payload storage used by cached L2 writebacks.
+    data_file: Arc<parking_lot::RwLock<Arc<S>>>,
+
     /// L2 table cache
     l2: AsyncLruCache<HostCluster, L2Table, L2CacheBackend<S>>,
 
@@ -156,16 +179,22 @@ impl<S: Storage> MetadataCaches<S> {
     /// The L2 cache is going to hold `l2_entries` tables, the refblock cache will have
     /// `rb_entries` refcount blocks.
     pub fn new(file: &Arc<S>, header: &Arc<Header>, l2_entries: usize, rb_entries: usize) -> Self {
+        let data_file = Arc::new(parking_lot::RwLock::new(Arc::clone(file)));
         let l2_backend =
-            L2CacheBackend::new(Arc::clone(file), Arc::clone(header));
+            L2CacheBackend::new(Arc::clone(file), Arc::clone(header), Arc::clone(&data_file));
         let rb_backend = RefBlockCacheBackend::new(Arc::clone(file), Arc::clone(header));
 
         MetadataCaches {
             file: Arc::clone(file),
+            data_file,
             l2: AsyncLruCache::new(l2_backend, l2_entries),
             rb: AsyncLruCache::new(rb_backend, rb_entries),
             direction: Default::default(),
         }
+    }
+
+    pub fn set_data_file(&self, file: Option<Arc<S>>) {
+        *self.data_file.write() = file.unwrap_or_else(|| Arc::clone(&self.file));
     }
 
     /// Make sure the refblock cache is flushed before the L2 cache.

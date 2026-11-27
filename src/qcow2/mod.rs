@@ -56,7 +56,7 @@ pub struct Qcow2<S: Storage + 'static, F: WrappedFormat<S> + 'static = FormatAcc
     /// Whether the user explicitly assigned a data file storage object (or `None`).
     storage_set: bool,
     /// Data file storage object; will use `metadata` if `None`.
-    storage: Option<S>,
+    storage: Option<Arc<S>>,
     /// Whether the user explicitly assigned a backing file (or `None`).
     backing_set: bool,
     /// Backing image.
@@ -226,7 +226,8 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     /// `None` means using the same data storage for both metadata and data, which should be used
     /// if [`Qcow2::requires_external_data_file()`] is `false`.
     pub fn set_data_file(&mut self, file: Option<S>) {
-        self.storage = file;
+        self.storage = file.map(Arc::new);
+        self.caches.set_data_file(self.storage.clone());
         self.storage_set = true;
     }
 
@@ -243,7 +244,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     /// If we have an external data file, return that.  Otherwise, return the image (metadata)
     /// file.
     fn storage(&self) -> &S {
-        self.storage.as_ref().unwrap_or(&self.metadata)
+        self.storage.as_deref().unwrap_or(&self.metadata)
     }
 
     /// Return the image’s implicit data file (as given in the image header).
@@ -376,7 +377,8 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         mut gate: G,
     ) -> io::Result<()> {
         if !self.storage_set {
-            self.storage = self.open_implicit_data_file(&mut gate).await?;
+            self.storage = self.open_implicit_data_file(&mut gate).await?.map(Arc::new);
+            self.caches.set_data_file(self.storage.clone());
             self.storage_set = true;
         }
 

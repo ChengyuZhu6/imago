@@ -330,7 +330,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
         let l2_allocation = self.allocate_meta_cluster().await?;
         l2_table.set_cluster(l2_allocation.cluster());
-        l2_table.write(self.metadata.as_ref()).await?;
+        l2_table.write_if_modified(self.metadata.as_ref(), self.storage(), &self.header, l2_allocation.cluster()).await?;
 
         l1_locked.enter_l2_table(l1_index, &l2_table, Some(l2_allocation))?;
         l1_locked
