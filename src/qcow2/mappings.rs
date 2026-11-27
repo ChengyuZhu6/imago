@@ -1076,4 +1076,159 @@ mod tests {
             "refcount increment for {host_cluster:?} lost on disk"
         );
     }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_validate_active_metadata() -> io::Result<()> {
+        let state = Arc::new(MemStorageState::default());
+        let access = FormatAccess::new(create_image(&state, 32768, 16).await);
+        access.write(&[0x5a; 1024][..], 0).await?;
+        access.flush().await?;
+        drop(access);
+
+        state.data.lock()[88..96].copy_from_slice(&(1u64 << 63).to_be_bytes());
+        let clean = state.data.lock().clone();
+        let load_u64 = |at| u64::from_be_bytes(clean[at..at + 8].try_into().unwrap());
+        let l1 = load_u64(40) as usize;
+        let l2 = (load_u64(l1) & !(1 << 63)) as usize;
+        let data = (load_u64(l2) & !(1 << 63)) as usize;
+        let rt = load_u64(48) as usize;
+        let rb = load_u64(rt) as usize;
+        let data_refcount = rb + data / 512 * 2;
+        let l2_refcount = rb + l2 / 512 * 2;
+
+        for (at, bytes) in [
+            (36, 0u32.to_be_bytes().to_vec()),
+            (36, (L1Table::MAX_ENTRIES as u32 + 1).to_be_bytes().to_vec()),
+            (40, (rt as u64).to_be_bytes().to_vec()),
+            (l1, (rb as u64 | 1 << 63).to_be_bytes().to_vec()),
+            (l2, (rb as u64 | 1 << 63).to_be_bytes().to_vec()),
+            (l2, (rb as u64 | 1 << 62).to_be_bytes().to_vec()),
+            (rb, 0u64.to_be_bytes().to_vec()),
+            (rt, (l2 as u64).to_be_bytes().to_vec()),
+            (data_refcount, 0u16.to_be_bytes().to_vec()),
+            (data_refcount, 2u16.to_be_bytes().to_vec()),
+            (l2_refcount, 2u16.to_be_bytes().to_vec()),
+            (l2, (data as u64).to_be_bytes().to_vec()),
+            (l1, (l2 as u64).to_be_bytes().to_vec()),
+            (l2 + 8, load_u64(l2).to_be_bytes().to_vec()),
+        ] {
+            let mut malformed = clean.clone();
+            malformed[at..at + bytes.len()].copy_from_slice(&bytes);
+            state.data.lock().clone_from(&malformed);
+            let result = Qcow2::<MemStorage>::builder(MemStorage::new(Arc::clone(&state), false))
+                .write(true)
+                .open(DenyImplicitOpenGate::default())
+                .await;
+            let error = match result {
+                Ok(image) => image.validate_active_metadata().await.unwrap_err(),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(*state.data.lock(), malformed);
+        }
+
+        // Shared data and shared L2 tables have accurate clear COPIED bits.
+        let mut shared = clean.clone();
+        for (entry, cluster) in [(l1, l2), (l2, data)] {
+            shared[entry..entry + 8].copy_from_slice(&(cluster as u64).to_be_bytes());
+            let refcount = rb + cluster / 512 * 2;
+            shared[refcount..refcount + 2].copy_from_slice(&2u16.to_be_bytes());
+        }
+        for valid in [clean, shared] {
+            state.data.lock().clone_from(&valid);
+            let image = Qcow2::<MemStorage>::builder(MemStorage::new(Arc::clone(&state), false))
+                .write(true)
+                .open(DenyImplicitOpenGate::default())
+                .await?;
+            image.validate_active_metadata().await?;
+            assert_eq!(*state.data.lock(), valid);
+            let image = FormatAccess::new(image);
+            image.write(&[0x6b; 512][..], 512).await?;
+            assert_eq!(&state.data.lock()[88..96], &[0; 8]);
+            let mut original = [0; 512];
+            image.read(&mut original[..], 0).await?;
+            assert_eq!(original, [0x5a; 512]);
+            image.flush().await?;
+        }
+        Ok(())
+    }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_external_data_file_open_mode() -> io::Result<()> {
+        use crate::file::File;
+        use crate::format::gate::ImplicitOpenGate;
+        use crate::FormatDriverBuilder;
+
+        struct DataFileGate(bool);
+
+        #[maybe_async::maybe_async(AFIT)]
+        impl ImplicitOpenGate<File> for DataFileGate {
+            async fn open_format<F: FormatDriverBuilder<File>>(
+                &mut self,
+                builder: F,
+            ) -> io::Result<FormatAccess<File>> {
+                DenyImplicitOpenGate::default().open_format(builder).await
+            }
+
+            async fn open_storage(&mut self, options: StorageOpenOptions) -> io::Result<File> {
+                assert_eq!(options.get_writable(), self.0);
+                File::open(options).await
+            }
+        }
+
+        let path =
+            std::env::temp_dir().join(format!("imago-qcow2-external-{}.qcow2", std::process::id()));
+        let data_path = path.with_extension("data");
+        let _cleanup = crate::misc_helpers::DropGuard::new(|| {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&data_path);
+        });
+        std::fs::write(&path, []).unwrap();
+        std::fs::write(&data_path, []).unwrap();
+        let metadata = File::open(StorageOpenOptions::new().filename(&path).write(true)).await?;
+        let data = File::open(StorageOpenOptions::new().filename(&data_path).write(true)).await?;
+        let qcow2 = Qcow2::<File>::create_builder(metadata)
+            .cluster_size(512)
+            .size(1024)
+            .data_file(
+                data_path.file_name().unwrap().to_str().unwrap().to_owned(),
+                data,
+            )
+            .create_open(DenyImplicitOpenGate::default(), |image| {
+                Ok(Qcow2::<File>::builder(image))
+            })
+            .await?;
+        let image = FormatAccess::new(qcow2);
+        image.write(&[0x5au8; 512][..], 0).await?;
+        image.flush().await?;
+        drop(image);
+        let original_metadata = std::fs::read(&path).unwrap();
+        let original_data = std::fs::read(&data_path).unwrap();
+        for writable in [false, true] {
+            for implicit in [false, true] {
+                let metadata =
+                    File::open(StorageOpenOptions::new().filename(&path).write(writable)).await?;
+                let qcow2 = if implicit {
+                    let mut qcow2 = Qcow2::<File>::open_image(metadata, writable).await?;
+                    qcow2
+                        .open_implicit_dependencies_gated(DataFileGate(writable))
+                        .await?;
+                    qcow2
+                } else {
+                    Qcow2::<File>::builder(metadata)
+                        .write(writable)
+                        .open(DataFileGate(writable))
+                        .await?
+                };
+                let image = FormatAccess::new(qcow2);
+                let mut buf = [0; 512];
+                image.read(&mut buf[..], 0).await?;
+                assert_eq!(buf, [0x5a; 512]);
+                drop(image);
+                assert_eq!(std::fs::read(&path).unwrap(), original_metadata);
+                assert_eq!(std::fs::read(&data_path).unwrap(), original_data);
+            }
+        }
+        Ok(())
+    }
 }
