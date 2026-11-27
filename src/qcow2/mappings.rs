@@ -1231,4 +1231,83 @@ mod tests {
         }
         Ok(())
     }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_eof_zero_fill() -> io::Result<()> {
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = create_image(&state, 1024, 16).await;
+        let l1_offset = qcow2.header.l1_table_offset().0;
+        qcow2.flush().await?;
+        drop(qcow2);
+        state.data.lock().truncate(l1_offset as usize);
+        let qcow2 = Qcow2::<MemStorage>::builder(MemStorage::new(Arc::clone(&state), false))
+            .write(true)
+            .open(DenyImplicitOpenGate::default())
+            .await?;
+        let image = FormatAccess::new(qcow2);
+        let mut data = [0xff; 1024];
+        image.read(&mut data[..], 0).await?;
+        assert_eq!(data, [0; 1024]);
+        image.write(&[0x5a; 512][..], 0).await?;
+        let (Mapping::Raw { offset, .. }, _) = image.get_mapping(0, 512).await? else {
+            panic!("Expected allocated data");
+        };
+        state.data.lock().truncate(offset as usize + 511);
+        image.read(&mut data[..], 0).await?;
+        assert_eq!(&data[..511], &[0x5a; 511]);
+        assert_eq!(&data[511..], &[0; 513]);
+        let (Mapping::Raw { offset: mapped, .. }, _) = image.get_mapping(0, 512).await? else {
+            panic!("Truncated data must remain mapped");
+        };
+        assert_eq!(mapped, offset);
+        // Partial writes copy the zero-filled tail before updating their new mapping.
+        image.write(&[0xab][..], 32).await?;
+        image.read(&mut data[..], 0).await?;
+        assert_eq!(data[32], 0xab);
+        assert_eq!(data[511], 0);
+        image.flush().await
+    }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_v2_zero_discard_with_header_backing() -> io::Result<()> {
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = Qcow2::<MemStorage>::create_builder(MemStorage::new(Arc::clone(&state), false))
+            .cluster_size(512)
+            .size(1024)
+            .backing("base.raw".into(), "raw".into())
+            .create_open(DenyImplicitOpenGate::default(), |storage| {
+                Ok(Qcow2::<MemStorage>::builder(storage)
+                    .backing(None)
+                    .write(true))
+            })
+            .await?;
+        let image = FormatAccess::new(qcow2);
+        image.write(&[0x2a; 512][..], 0).await?;
+        image.flush().await?;
+        drop(image);
+        state.data.lock()[4..8].copy_from_slice(&2u32.to_be_bytes());
+        let qcow2 = Qcow2::<MemStorage>::builder(MemStorage::new(Arc::clone(&state), false))
+            .backing(None)
+            .write(true)
+            .open(DenyImplicitOpenGate::default())
+            .await?;
+        let mut image = FormatAccess::new(qcow2);
+        let error = image.discard_to_zero(0, 512).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        image.flush().await?;
+        drop(image);
+        let backing_state = Arc::new(MemStorageState::default());
+        backing_state.data.lock().resize(1024, 0x77);
+        let backing =
+            FormatAccess::new(Raw::open_image(MemStorage::new(backing_state, false), false).await?);
+        let qcow2 = Qcow2::<MemStorage>::builder(MemStorage::new(state, false))
+            .backing(Some(backing))
+            .open(DenyImplicitOpenGate::default())
+            .await?;
+        let mut actual = [0; 1024];
+        FormatAccess::new(qcow2).read(&mut actual[..], 0).await?;
+        assert_eq!(&actual[..512], &[0x2a; 512]);
+        assert_eq!(&actual[512..], &[0x77; 512]);
+        Ok(())
+    }
 }
