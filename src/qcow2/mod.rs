@@ -7,6 +7,8 @@ mod cache;
 mod cancel_tests;
 mod compressed;
 mod cow;
+#[cfg(test)]
+mod durability_tests;
 mod io_func;
 mod mappings;
 mod metadata;
