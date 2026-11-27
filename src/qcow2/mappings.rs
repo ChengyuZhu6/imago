@@ -1362,4 +1362,100 @@ mod tests {
         }
         Ok(())
     }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_discard_passthrough_defaults_to_disabled() -> io::Result<()> {
+        let state = Arc::new(MemStorageState::default());
+        let mut image = FormatAccess::new(create_image(&state, 1024, 16).await);
+        image.write(&[0x5a; 512][..], 0).await?;
+        image.discard_to_zero(0, 512).await?;
+        image.flush().await?;
+        assert!(state.discarded.lock().is_empty());
+        Ok(())
+    }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn discard_preserves_partial_clusters_with_best_effort_reclaim() -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        for version in [2u32, 3] {
+            for failure in ["sync", "write", "discard"] {
+                let state = Arc::new(MemStorageState::default());
+                let qcow2 = create_image(&state, 4096, 16).await;
+                qcow2.flush().await?;
+                drop(qcow2);
+                state.data.lock()[4..8].copy_from_slice(&version.to_be_bytes());
+                let mut qcow2 =
+                    Qcow2::<MemStorage>::builder(MemStorage::new(Arc::clone(&state), false))
+                        .write(true)
+                        .open(DenyImplicitOpenGate::default())
+                        .await?;
+                qcow2.set_discard_passthrough(true);
+                let mut image = FormatAccess::new(qcow2);
+                let mut expected = vec![0x5a; 4096];
+                image.write(&expected[..], 0).await?;
+                image.flush().await?;
+                image.sync().await?;
+                let (Mapping::Raw { offset, .. }, _) = image.get_mapping(512, 512).await? else {
+                    panic!("expected data cluster");
+                };
+                match failure {
+                    "sync" => state.fail_next_sync.store(true, Ordering::Relaxed),
+                    "write" => state.fail_next_write.store(true, Ordering::Relaxed),
+                    "discard" => state.fail_next_discard.store(true, Ordering::Relaxed),
+                    _ => unreachable!(),
+                }
+                // Full middle clusters are freed, while both partial clusters are zeroed by COW.
+                let _ = image.discard_to_zero(256, 1024).await;
+                assert!(
+                    state.discarded.lock().is_empty(),
+                    "release before {failure} recovery"
+                );
+                image.discard_to_zero(256, 1024).await?;
+                image.flush().await?;
+                image.sync().await?;
+                expected[256..1280].fill(0);
+                let mut actual = vec![0; 4096];
+                image.read(&mut actual[..], 0).await?;
+                assert_eq!(actual, expected, "v{version}, {failure}");
+                assert_eq!(
+                    state.discarded.lock().contains(&(offset, 512)),
+                    failure != "discard"
+                );
+                image.write(&[0xa5; 512][..], 2048).await?;
+                image.flush().await?;
+                image.sync().await?;
+                expected[2048..2560].fill(0xa5);
+                let (
+                    Mapping::Raw {
+                        offset: released, ..
+                    },
+                    _,
+                ) = image.get_mapping(3584, 512).await?
+                else {
+                    panic!("expected data cluster");
+                };
+                image.discard_to_backing(3584, 512).await?;
+                expected[3584..].fill(0);
+                image.flush().await?;
+                image.sync().await?;
+                let cluster = released / 512;
+                let rb = state.read_u64(state.read_u64(48) + cluster / 256 * 8);
+                let refcount = (rb + cluster % 256 * 2) as usize;
+                assert_eq!(
+                    &state.data.lock()[refcount..refcount + 2],
+                    &[0, 0],
+                    "discard-to-backing leaked its cluster"
+                );
+                drop(image);
+                let qcow2 =
+                    Qcow2::<MemStorage>::builder(MemStorage::new(Arc::clone(&state), false))
+                        .open(DenyImplicitOpenGate::default())
+                        .await?;
+                FormatAccess::new(qcow2).read(&mut actual[..], 0).await?;
+                assert_eq!(actual, expected, "reopened v{version}, {failure}");
+            }
+        }
+        Ok(())
+    }
 }
