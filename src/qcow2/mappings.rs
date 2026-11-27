@@ -131,9 +131,9 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             .do_get_mapping_with_l2(offset, length, &l2_table)
             .await?;
         if let ShallowMapping::Raw {
-            storage: _,
             offset,
             writable: true,
+            ..
         } = existing.0
         {
             if existing.1 >= length {
@@ -142,6 +142,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         }
 
         let l2_table = l2_table.lock_write().await;
+        self.header.ensure_healthy()?;
 
         let mut l2_changes = Vec::new();
         let res = self
@@ -166,6 +167,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             }
         };
 
+        self.header.ensure_healthy()?;
         // Everything may turn out to be mapped already, e.g. when a concurrent request has mapped
         // it while we were waiting for the lock
         let prepared_mapping = (!l2_changes.is_empty()).then(|| PreparedMappingState {
@@ -181,6 +183,9 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     ///
     /// Underlying implementation for [`Qcow2::commit_data_mapping()`].
     pub(super) async fn do_commit_data_mapping(&self, state: PreparedMappingState) {
+        if self.header.ensure_healthy().is_err() {
+            return;
+        }
         let PreparedMappingState {
             mut l2_table,
             l2_changes,
@@ -241,6 +246,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
         let l2_table = self.ensure_l2(first_cluster.offset(cb)).await?;
         let l2_table = l2_table.lock_write().await;
+        self.header.ensure_healthy()?;
 
         let res = self
             .ensure_fixed_mapping_no_cleanup(first_cluster, cluster_count, mapping, l2_table)
@@ -274,7 +280,12 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     ) -> io::Result<Option<Arc<L2Table>>> {
         let cb = self.header.cluster_bits();
 
-        let l1_entry = self.l1_table.read().await.get(offset.l1_index(cb));
+        let l1_locked = self.l1_table.read().await;
+        if writable {
+            self.header.ensure_healthy()?;
+        }
+        let l1_entry = l1_locked.get(offset.l1_index(cb));
+        drop(l1_locked);
         if let Some(l2_offset) = l1_entry.l2_offset() {
             if writable && !l1_entry.is_copied() {
                 return Ok(None);
@@ -285,7 +296,9 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 ))
             })?;
 
-            self.caches.l2_get_or_insert(l2_cluster).await.map(Some)
+            let l2 = self.caches.l2_get_or_insert(l2_cluster).await?;
+            self.header.ensure_healthy()?;
+            Ok(Some(l2))
         } else {
             Ok(None)
         }
@@ -305,6 +318,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         self.prepare_write().await?;
 
         let mut l1_locked = self.l1_table.write().await;
+        self.header.ensure_healthy()?;
         let l1_index = offset.l1_index(cb);
         if !l1_locked.in_bounds(l1_index) {
             l1_locked = self.grow_l1_table(l1_locked, l1_index).await?;
@@ -319,6 +333,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             })?;
 
             let l2 = self.caches.l2_get_or_insert(l2_cluster).await?;
+            self.header.ensure_healthy()?;
             if l1_entry.is_copied() {
                 return Ok(l2);
             }
@@ -330,12 +345,25 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
         let l2_allocation = self.allocate_meta_cluster().await?;
         l2_table.set_cluster(l2_allocation.cluster());
-        l2_table.write_if_modified(self.metadata.as_ref(), self.storage(), &self.header, l2_allocation.cluster()).await?;
+        l2_table
+            .write_if_modified(
+                self.metadata.as_ref(),
+                self.storage(),
+                &self.header,
+                l2_allocation.cluster(),
+            )
+            .await?;
+        // Unlike cached L2 entries, the L1 entry is written immediately.
+        self.caches.flush_rb().await?;
 
+        self.header.ensure_healthy()?;
         l1_locked.enter_l2_table(l1_index, &l2_table, Some(l2_allocation))?;
+        let mut publication = self.header.publication_guard();
         l1_locked
             .write_entry(self.metadata.as_ref(), l1_index)
             .await?;
+        self.header.ensure_healthy()?;
+        publication.disarm();
 
         // Free old L2 table, if any
         if let Some(l2_offset) = l1_entry.l2_offset() {
@@ -348,6 +376,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
         let l2_table = Arc::new(l2_table);
         self.caches.l2_insert(Arc::clone(&l2_table)).await?;
+        self.header.ensure_healthy()?;
         Ok(l2_table)
     }
 
@@ -359,28 +388,34 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         mut l1_locked: RwLockWriteGuard<'a, L1Table>,
         at_least_index: usize,
     ) -> io::Result<RwLockWriteGuard<'a, L1Table>> {
+        self.header.ensure_healthy()?;
         let mut new_l1 = l1_locked.clone_and_grow(at_least_index, &self.header)?;
 
         let l1_allocation = self.allocate_meta_clusters(new_l1.cluster_count()).await?;
 
         new_l1.set_cluster(l1_allocation.cluster());
         new_l1.write(self.metadata.as_ref()).await?;
+        self.caches.flush_rb().await?;
 
+        let header_locked = self.header.publication_lock.lock().await;
+        self.header.ensure_healthy()?;
         self.header.set_l1_table(&new_l1, Some(l1_allocation))?;
+        let mut publication = self.header.publication_guard();
         self.header
             .write_l1_table_pointer(self.metadata.as_ref())
             .await?;
 
-        if let Some(old_l1_cluster) = l1_locked.get_cluster() {
-            let old_l1_size = l1_locked.cluster_count();
-            l1_locked.unset_cluster();
+        let mut old_l1 = std::mem::replace(&mut *l1_locked, new_l1);
+        publication.disarm();
+        drop(header_locked);
+        if let Some(old_l1_cluster) = old_l1.get_cluster() {
+            let old_l1_size = old_l1.cluster_count();
+            old_l1.unset_cluster();
             self.clusters_to_free
                 .push(ClustersToFreeEntry::metadata(old_l1_cluster, old_l1_size));
-            self.process_clusters_to_free().await;
         }
 
-        *l1_locked = new_l1;
-
+        self.header.ensure_healthy()?;
         Ok(l1_locked)
     }
 
