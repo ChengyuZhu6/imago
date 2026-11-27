@@ -624,3 +624,48 @@ async fn test_parallel_write_with_several_allocations() {
     image.read(&mut buf[..], 4 * 512).await.unwrap();
     assert!(buf == [0x55u8; 2 * 512], "Data not read back correctly");
 }
+
+#[tokio::test]
+async fn test_cancelled_resize_rejects_retry() -> io::Result<()> {
+    for (new_size, late_write, expected_size) in [
+        (1536, false, 2048),
+        (1536, true, 1536),
+        (2560, false, 2048),
+        (2560, true, 2048),
+    ] {
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = crate::test::mem_storage::create_image(&state, 2048).await;
+        let metadata = Arc::clone(&qcow2.metadata);
+        let mut image = FormatAccess::new(qcow2);
+        image.write(&[0x5au8; 512][..], 0).await?;
+        image.flush().await?;
+        *state.hold_range.lock() = Some(0..72);
+        state.hold_writes.store(late_write, Ordering::Relaxed);
+        let blocker = if late_write {
+            None
+        } else {
+            Some(metadata.strong_write_blocker(0..72).await)
+        };
+        assert!(image
+            .resize(new_size, PreallocateMode::None)
+            .now_or_never()
+            .is_none());
+        state.hold_writes.store(false, Ordering::Relaxed);
+        drop(blocker);
+        assert_eq!(image.size(), 2048);
+        image
+            .resize(new_size, PreallocateMode::None)
+            .await
+            .unwrap_err();
+        image.sync().await.unwrap_err();
+        state.complete_held_writes();
+        image.flush().await.unwrap_err();
+        drop(image);
+        let reopened = open_image(&state).await;
+        assert_eq!(reopened.size(), expected_size);
+        let mut buf = [0; 512];
+        reopened.read(&mut buf[..], 0).await?;
+        assert_eq!(buf, [0x5a; 512]);
+    }
+    Ok(())
+}
