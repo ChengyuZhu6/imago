@@ -1310,4 +1310,56 @@ mod tests {
         assert_eq!(&actual[512..], &[0x77; 512]);
         Ok(())
     }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn test_cancelled_cached_writeback_settles_before_retry() -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        for refblock in [false, true] {
+            let state = Arc::new(MemStorageState::default());
+            let qcow2 = create_image(&state, 4096, 16).await;
+            qcow2.ensure_data_mapping(0, 512, true).await?;
+            qcow2.flush().await?;
+            qcow2.ensure_data_mapping(512, 512, true).await?;
+            let offset = if refblock {
+                state.read_u64(state.read_u64(48))
+            } else {
+                qcow2.l1_table.read().await.get(0).l2_offset().unwrap().0
+            };
+            *state.hold_range.lock() = Some(offset..offset + 512);
+            state.hold_writes.store(true, Ordering::Relaxed);
+            let mut flush = Box::pin(qcow2.flush());
+            assert!(crate::test::mem_storage::poll_once(flush.as_mut()).is_pending());
+            assert_eq!(state.held.lock().len(), 1);
+            drop(flush);
+            qcow2.header.ensure_healthy()?;
+            state.hold_writes.store(false, Ordering::Relaxed);
+            qcow2.ensure_data_mapping(1024, 512, true).await?;
+            let mut retry = Box::pin(qcow2.flush());
+            let std::task::Poll::Ready(result) =
+                crate::test::mem_storage::poll_once(retry.as_mut())
+            else {
+                panic!("Settling held writes must allow the retry to complete");
+            };
+            result?;
+            assert!(state.held.lock().is_empty());
+            state.complete_held_writes();
+            state.release_held_writes();
+            drop(retry);
+            qcow2.sync().await?;
+            let reopened = Qcow2::<MemStorage>::builder(MemStorage::new(Arc::clone(&state), false))
+                .write(true)
+                .open(DenyImplicitOpenGate::default())
+                .await?;
+            reopened.validate_active_metadata().await?;
+            for guest in [0, 512, 1024] {
+                assert!(matches!(
+                    reopened.get_mapping(guest, 512).await?.0,
+                    ShallowMapping::Raw { .. }
+                ));
+            }
+            reopened.flush().await?;
+        }
+        Ok(())
+    }
 }
