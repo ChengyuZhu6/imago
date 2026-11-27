@@ -1040,27 +1040,38 @@ impl Header {
         Ok(result)
     }
 
-    async fn write_v2_header<S: Storage>(&self, image: &S) -> io::Result<()> {
+    /// Write mutable header fields under the caller's publication lock.
+    pub(super) async fn write_v2_header<S: Storage>(&self, image: &S) -> io::Result<()> {
+        self.ensure_healthy()?;
         let v2_header = encode_binary(&self.v2)?;
-        image.write(&v2_header, 0).await
+        image.write(&v2_header, 0).await?;
+        self.ensure_healthy()
     }
 
     /// Write the refcount table pointer (offset and size) under the caller's publication lock.
     pub async fn write_reftable_pointer<S: Storage>(&self, image: &S) -> io::Result<()> {
-        // TODO: Just write the reftable offset and size
         self.write_v2_header(image).await
     }
 
     /// Write the L1 table pointer (offset and size) under the caller's publication lock.
     pub async fn write_l1_table_pointer<S: Storage>(&self, image: &S) -> io::Result<()> {
-        // TODO: Just write the L1 table offset and size
         self.write_v2_header(image).await
     }
 
     /// Publish the guest disk size, rejecting further operations if the write is uncertain.
-    pub async fn write_size<S: Storage>(&self, image: &S) -> io::Result<()> {
-        // TODO: Just write the size
-        self.write_v2_header(image).await
+    pub async fn write_size<S: Storage>(&self, image: &S, new_size: u64) -> io::Result<()> {
+        self.ensure_healthy()?;
+        let _lock = self.publication_lock.lock().await;
+        self.ensure_healthy()?;
+        let old_size = self.size();
+        let mut publication = DropGuard::new(|| {
+            self.publication_failed.store(true, Ordering::Release);
+            self.set_size(old_size);
+        });
+        self.set_size(new_size);
+        self.write_v2_header(image).await?;
+        publication.disarm();
+        Ok(())
     }
 }
 
