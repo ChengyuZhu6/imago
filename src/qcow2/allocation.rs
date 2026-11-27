@@ -195,6 +195,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         &self,
         guest_cluster: GuestCluster,
     ) -> io::Result<PendingClusters> {
+        self.header.ensure_healthy()?;
         if self.header.external_data_file() {
             let cluster = HostCluster(guest_cluster.0);
             Ok(self
@@ -206,9 +207,12 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             // Allocate clusters before setting up L2 entries
             self.caches.l2_depends_on_rb().await?;
 
-            allocator
+            let allocation = allocator
                 .allocate_clusters(ClusterCount(1), None, false)
-                .await
+                .await?;
+            // A concurrent flush may have snapshotted the RB before its refcount increment.
+            self.caches.l2_depends_on_rb().await?;
+            Ok(allocation)
         }
     }
 
@@ -224,6 +228,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         guest_cluster: GuestCluster,
         mandatory_host_cluster: Option<HostCluster>,
     ) -> io::Result<Option<PendingClusters>> {
+        self.header.ensure_healthy()?;
         let Some(mandatory_host_cluster) = mandatory_host_cluster else {
             return self.allocate_data_cluster(guest_cluster).await.map(Some);
         };
@@ -241,13 +246,18 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
                 .await?
         };
 
-        Ok(allocated.then(|| {
+        let allocation = allocated.then(|| {
             self.clusters_to_free
                 .pending_guard(ClustersToFreeEntry::data(
                     mandatory_host_cluster,
                     ClusterCount(1),
                 ))
-        }))
+        });
+        if allocation.is_some() && !self.header.external_data_file() {
+            // Reestablish the dependency after the refcount change.
+            self.caches.l2_depends_on_rb().await?;
+        }
+        Ok(allocation)
     }
 
     /// Free all clusters in `self.clusters_to_free`.

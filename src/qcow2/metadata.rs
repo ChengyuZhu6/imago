@@ -1,6 +1,7 @@
 //! Functionality for working with qcow2 metadata.
 
 use super::allocation::{ClustersToFreeEntry, PendingClusters};
+use super::cache::PayloadDurability;
 use super::compressed::CompressedClusterReadGuard;
 use super::types::*;
 use crate::io_buffers::IoBuffer;
@@ -1813,20 +1814,20 @@ pub(super) struct L2Table {
     /// Whether this table has been modified since it was last written.
     modified: AtomicBool,
 
-    /// Lock for creating `L2TableWriteGuard` (write) and `CompressedClusterReadGuard` (read).
-    ///
-    /// This is an owning (`Arc`-backed) lock, i.e. any access guard will have a strong reference
-    /// to it and can thus be held independently of lifetime concerns, e.g. across a data write
-    /// while a prepared mapping is not yet committed (see `Qcow2::prepare_data_mapping()`).
-    ///
-    /// Consequently, it may be held outside of qcow2 code paths, e.g. while a data write is in
-    /// flight (between preparing and committing a data mapping for it).  Thus, writing this table
-    /// to disk must work without the lock because otherwise flushing the table would deadlock
-    /// against such writes.
+    /// Serializes mapping changes against other writers and compressed readers.
+    /// Prepared mappings retain the owning guard across payload I/O, so writeback must
+    /// use its separate locks to avoid deadlocking with allocation's cache dependencies.
     writer_lock: OwnedRwLock<()>,
 
     /// Serializes writing this table back to disk (see [`L2Table::write_if_modified()`]).
     writeback_lock: Mutex<()>,
+
+    /// A dropped writeback may still write its snapshot after releasing the lock.
+    writeback_cancelled: AtomicBool,
+
+    /// Binds a snapshot to the highest payload generation set by mapping commits.
+    /// Held only while copying entries or modifying them, never across I/O.
+    payload_dependency: parking_lot::Mutex<u64>,
 }
 
 /// Write guard for an L2 table.
@@ -1856,6 +1857,8 @@ impl L2Table {
             modified: true.into(),
             writer_lock: Default::default(),
             writeback_lock: Default::default(),
+            writeback_cancelled: AtomicBool::new(false),
+            payload_dependency: Default::default(),
         }
     }
 
@@ -1894,28 +1897,53 @@ impl L2Table {
     /// Write this table to disk if it has been modified since it was last written.
     ///
     /// This is the entry point for writing back a table that is part of the L2 cache; it
-    /// serializes such write-backs against each other via `writeback_lock`.  Writing the table
-    /// clears the modified flag before copying the entries, so without that lock, two concurrent
-    /// write-backs could race such that the one with the older copy writes last, leaving that
-    /// older copy on disk while the table no longer appears modified.  Holding the lock across the
-    /// modified check means that a write-back which has to wait only writes again if something
-    /// changed after the preceding write-back’s copy.
+    /// serializes write-backs via `writeback_lock` so an older snapshot cannot write last.
+    /// Snapshot entries, dirty state and payload dependency are taken under a short lock.
+    /// Later commits remain dirty for another writeback; failed writebacks restore the dependency.
     ///
     /// `cluster` is the cluster this table is expected to belong to; an `assert!()` verifies that
     /// it really is the table’s cluster.
     pub async fn write_if_modified<S: Storage>(
         &self,
         image: &S,
+        data_file: &S,
+        payload: &PayloadDurability,
+        header: &Header,
         cluster: HostCluster,
     ) -> io::Result<()> {
+        header.ensure_healthy()?;
         let _lock = self.writeback_lock.lock().await;
-
-        if !self.is_modified() {
-            return Ok(());
+        header.ensure_healthy()?;
+        if self.writeback_cancelled.load(Ordering::Relaxed) {
+            image.settle_writes().await?;
+            self.writeback_cancelled.store(false, Ordering::Relaxed);
         }
 
         assert!(self.get_cluster().unwrap() == cluster);
-        self.write(image).await
+        let (buffer, offset, depends_on_payload) = {
+            let mut dependency = self.payload_dependency.lock();
+            if !self.is_modified() {
+                return Ok(());
+            }
+            let (buffer, offset) = self.snapshot(image)?;
+            self.clear_modified();
+            (buffer, offset, std::mem::take(&mut *dependency))
+        };
+        let mut modified = DropGuard::new(|| {
+            let mut dependency = self.payload_dependency.lock();
+            *dependency = (*dependency).max(depends_on_payload);
+            self.set_modified();
+        });
+        payload.sync(data_file, depends_on_payload).await?;
+        header.ensure_healthy()?;
+        let mut cancelled =
+            DropGuard::new(|| self.writeback_cancelled.store(true, Ordering::Relaxed));
+        let result = image.write(&buffer, offset.0).await;
+        cancelled.disarm();
+        result?;
+        header.ensure_healthy()?;
+        modified.disarm();
+        Ok(())
     }
 }
 
@@ -1954,6 +1982,7 @@ impl L2TableWriteGuard {
         index: usize,
         host_cluster: HostCluster,
         new_allocation: Option<PendingClusters>,
+        payload_generation: u64,
     ) -> Option<ClustersToFreeEntry> {
         if let Some(new_allocation) = new_allocation.as_ref() {
             debug_assert_eq!(new_allocation.cluster(), host_cluster);
@@ -1966,6 +1995,8 @@ impl L2TableWriteGuard {
             },
             self.table.cluster_bits,
         );
+        let mut dependency = self.table.payload_dependency.lock();
+        *dependency = (*dependency).max(payload_generation);
         // Safe: We set a full valid mapping, and there is only one writer (thanks to
         // `L2TableWriteGuard`).
         let l2e = unsafe { self.table.data[index].swap(new) };
@@ -1974,16 +2005,9 @@ impl L2TableWriteGuard {
             new_allocation.make_persistent();
         }
 
-        let allocation = l2e.allocation(self.table.cluster_bits, self.table.external_data_file);
-        if let Some((a_cluster, a_count)) = allocation {
-            if a_cluster == host_cluster && a_count == ClusterCount(1) {
-                None
-            } else {
-                Some(ClustersToFreeEntry::data(a_cluster, a_count))
-            }
-        } else {
-            None
-        }
+        l2e.allocation(self.table.cluster_bits, self.table.external_data_file)
+            .filter(|&(cluster, count)| cluster != host_cluster || count != ClusterCount(1))
+            .map(|(first_cluster, count)| ClustersToFreeEntry::data(first_cluster, count))
     }
 
     /// Make the given index a zero mapping.
@@ -2009,26 +2033,17 @@ impl L2TableWriteGuard {
                 L2Mapping::DataFile {
                     host_cluster,
                     copied,
-                } => Some((host_cluster, copied)),
-                L2Mapping::Backing { backing_offset: _ } => None,
-                L2Mapping::Zero {
+                }
+                | L2Mapping::Zero {
                     host_cluster: Some(host_cluster),
                     copied,
                 } => Some((host_cluster, copied)),
-                L2Mapping::Zero {
-                    host_cluster: None,
-                    copied: _,
-                } => None,
-                L2Mapping::Compressed {
-                    host_offset: _,
-                    length: _,
-                } => None,
+                _ => None,
             }
         } else {
             None
         };
 
-        let retained = cluster_copied.is_some();
         let new = if let Some((cluster, copied)) = cluster_copied {
             L2Mapping::Zero {
                 host_cluster: Some(cluster),
@@ -2042,12 +2057,13 @@ impl L2TableWriteGuard {
         };
         let new = L2Entry::from_mapping(new, self.table.cluster_bits);
 
+        let _snapshot = self.table.payload_dependency.lock();
         // Safe: We set a full valid mapping, and there is only one writer (thanks to
         // `L2TableWriteGuard`).
         let old = unsafe { self.table.data[index].swap(new) };
         self.table.modified.store(true, Ordering::Relaxed);
 
-        let leaked = if !retained {
+        let leaked = if cluster_copied.is_none() {
             old.allocation(self.table.cluster_bits, self.table.external_data_file)
                 .map(|(first_cluster, count)| ClustersToFreeEntry::data(first_cluster, count))
         } else {
@@ -2064,6 +2080,7 @@ impl L2TableWriteGuard {
     pub fn discard_cluster(&mut self, index: usize) -> Option<ClustersToFreeEntry> {
         let new = L2Entry(0);
 
+        let _snapshot = self.table.payload_dependency.lock();
         // Safe: We set a full valid mapping, and there is only one writer (thanks to
         // `L2TableWriteGuard`).
         let old = unsafe { self.table.data[index].swap(new) };
@@ -2091,6 +2108,8 @@ impl Table for L2Table {
             modified: true.into(),
             writer_lock: Default::default(),
             writeback_lock: Default::default(),
+            writeback_cancelled: AtomicBool::new(false),
+            payload_dependency: Default::default(),
         }
     }
 
@@ -2145,6 +2164,7 @@ impl Table for L2Table {
 
 impl Clone for L2Table {
     fn clone(&self) -> Self {
+        let dependency = self.payload_dependency.lock();
         let mut data = Vec::with_capacity(self.data.len());
         for entry in &self.data {
             // None of these can be `copied`
@@ -2162,6 +2182,8 @@ impl Clone for L2Table {
             modified,
             writer_lock: Default::default(),
             writeback_lock: Default::default(),
+            writeback_cancelled: AtomicBool::new(false),
+            payload_dependency: parking_lot::Mutex::new(*dependency),
         }
     }
 }
@@ -2411,6 +2433,9 @@ pub(super) struct RefBlock {
 
     /// Serializes writing this block back to disk (see [`RefBlock::write_if_modified()`]).
     writeback_lock: Mutex<()>,
+
+    /// A dropped writeback may still write its snapshot after releasing the lock.
+    writeback_cancelled: AtomicBool,
 }
 
 /// Write guard for a refblock.
@@ -2437,6 +2462,7 @@ impl RefBlock {
             modified: true.into(),
             writer_lock: Default::default(),
             writeback_lock: Default::default(),
+            writeback_cancelled: AtomicBool::new(false),
         })
     }
 
@@ -2472,6 +2498,7 @@ impl RefBlock {
             modified: false.into(),
             writer_lock: Default::default(),
             writeback_lock: Default::default(),
+            writeback_cancelled: AtomicBool::new(false),
         })
     }
 
@@ -2662,16 +2689,28 @@ impl RefBlock {
     pub async fn write_if_modified<S: Storage>(
         &self,
         image: &S,
+        header: &Header,
         cluster: HostCluster,
     ) -> io::Result<()> {
+        header.ensure_healthy()?;
         let _lock = self.writeback_lock.lock().await;
+        header.ensure_healthy()?;
 
         if !self.is_modified() {
             return Ok(());
         }
 
         assert!(self.get_cluster().unwrap() == cluster);
-        self.write(image).await
+        if self.writeback_cancelled.load(Ordering::Relaxed) {
+            image.settle_writes().await?;
+            self.writeback_cancelled.store(false, Ordering::Relaxed);
+        }
+        let mut cancelled =
+            DropGuard::new(|| self.writeback_cancelled.store(true, Ordering::Relaxed));
+        let result = self.write(image).await;
+        cancelled.disarm();
+        result?;
+        header.ensure_healthy()
     }
 
     /// Check whether this block has been modified since it was last written.
@@ -3012,6 +3051,17 @@ pub trait Table: Sized {
     ///
     /// Callers must ensure the table is copied, i.e. its refcount is 1.
     async fn write<S: Storage>(&self, image: &S) -> io::Result<()> {
+        self.clear_modified();
+        // Re-set the modified flag if we don’t get to execute the write
+        let mut modified_guard = DropGuard::new(|| self.set_modified());
+        let (buffer, offset) = self.snapshot(image)?;
+        image.write(&buffer, offset.0).await?;
+        modified_guard.disarm();
+        Ok(())
+    }
+
+    /// Copy a table snapshot without issuing storage I/O.
+    fn snapshot<S: Storage>(&self, image: &S) -> io::Result<(IoBuffer, HostOffset)> {
         let offset = self
             .get_offset()
             .ok_or_else(|| io::Error::other("Cannot write qcow2 metadata table, no offset set"))?;
@@ -3028,10 +3078,6 @@ pub trait Table: Sized {
         let byte_size = self.byte_size();
         let mut buffer = IoBuffer::new(byte_size, cmp::max(image.mem_align(), size_of::<u64>()))?;
 
-        self.clear_modified();
-        // Re-set the modified flag if we don’t get to execute the write
-        let mut modified_guard = DropGuard::new(|| self.set_modified());
-
         // Safe because we have just allocated this, and it fits the alignment
         let raw_table = unsafe { buffer.as_mut().into_typed_slice::<u64>() };
         for (i, be_value) in raw_table.iter_mut().enumerate() {
@@ -3039,11 +3085,7 @@ pub trait Table: Sized {
             *be_value = self.get_ref(i).map(|e| e.to_plain()).unwrap_or(0).to_be();
         }
 
-        image.write(&buffer, offset.0).await?;
-        // Write executed, disarm guard, flag can remaing cleared
-        modified_guard.disarm();
-
-        Ok(())
+        Ok((buffer, offset))
     }
 
     /// Write at least the given single (modified) entry to the image file.
