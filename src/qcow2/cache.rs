@@ -210,7 +210,7 @@ pub(super) struct MetadataCaches<S: Storage> {
     /// Backing storage for durability barriers between dependent metadata writes.
     file: Arc<S>,
 
-    /// Payload storage used by cached L2 writebacks.
+    /// Shared with L2 writeback so eviction flushes the actual payload storage.
     data_file: Arc<parking_lot::RwLock<Arc<S>>>,
 
     /// Durability of completed payload commits.
@@ -257,6 +257,7 @@ impl<S: Storage> MetadataCaches<S> {
         }
     }
 
+    /// Update the payload storage used by cached L2 writebacks.
     pub fn set_data_file(&self, file: Option<Arc<S>>) {
         *self.data_file.write() = file.unwrap_or_else(|| Arc::clone(&self.file));
         self.payload.durable.store(0, Ordering::Release);
@@ -298,6 +299,17 @@ impl<S: Storage> MetadataCaches<S> {
         }
         *dir = CacheDependency::RbDependsOnL2;
         Ok(())
+    }
+
+    /// Persist removed mappings before reclaiming their underlying data.
+    pub async fn flush_l2(&self) -> io::Result<()> {
+        let direction = self.direction.read().await;
+        if *direction == CacheDependency::L2DependsOnRb {
+            self.rb.flush().await?;
+            self.sync_metadata().await?;
+        }
+        self.l2.flush().await?;
+        self.sync_metadata().await
     }
 
     /// Flush both L2 and refblock cache to disk.
