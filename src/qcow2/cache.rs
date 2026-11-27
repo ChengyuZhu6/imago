@@ -449,6 +449,33 @@ mod tests {
     use super::*;
     use crate::null::Null;
 
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn saturated_payload_generation_keeps_syncing() -> io::Result<()> {
+        use crate::test::mem_storage::{MemStorage, MemStorageState, StorageEvent};
+        let payload = PayloadDurability::default();
+        payload.committed.store(u64::MAX - 1, Ordering::Relaxed);
+        let state = Arc::new(MemStorageState::default());
+        *state.events.lock() = Some(Vec::new());
+        let file = MemStorage::new(Arc::clone(&state), false);
+        for _ in 0..2 {
+            let generation = payload.register();
+            assert_eq!(generation, u64::MAX);
+            payload.sync(&file, generation).await?;
+        }
+        assert_eq!(
+            state
+                .events
+                .lock()
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event, StorageEvent::Sync))
+                .count(),
+            2
+        );
+        Ok(())
+    }
+
     fn make_test_caches() -> MetadataCaches<Null> {
         let null = Arc::new(Null::new(1 << 16));
         let header = Arc::new(Header::new(16, 1, None, None, None));

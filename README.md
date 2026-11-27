@@ -77,6 +77,27 @@ implementation.)
 
 In sync mode, `FormatAccess` implements `Drop` and flushes automatically.
 
+# Metadata write cancellation
+
+Cancelled cached L2 and refcount-block writebacks retain dirty state. A retry
+settles outstanding storage writes before publishing the next snapshot. Storage
+backends must implement `settle_writes()` when dropped I/O can complete later.
+
+Failed or cancelled immediate header or metadata pointer publications stop further
+I/O on that image instance. This failure state is held in memory. Wait for storage
+I/O to finish and verify image consistency before reopening. Unpublished allocations
+and cancelled physical discards can leave leaked clusters that require repair.
+
+New L2 mappings are written after their payload and allocation refcounts are durable,
+including cache eviction. Successful same-file metadata barriers cover payload commits
+registered before the barrier starts. L2 writebacks share that completed barrier,
+or a payload-only barrier for external data files. Later commits retain their own
+dependency. Failed or cancelled barriers do not advance the durable generation. This can add storage synchronization during allocating
+writes. Ordinary writes to existing data mappings use the existing fast path.
+
+Physical discard of released clusters is disabled by default. Call
+`Qcow2::set_discard_passthrough(true)` to enable best-effort storage reclamation.
+
 # Features
 
 - `async` *(default)*: Build with `async` support, which requires `tokio` (for async locking),

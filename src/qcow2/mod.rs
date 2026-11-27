@@ -6,7 +6,11 @@ mod cache;
 #[cfg(all(test, feature = "async"))]
 mod cancel_tests;
 mod compressed;
+#[cfg(all(test, feature = "async"))]
+mod concurrent_flush_tests;
 mod cow;
+#[cfg(test)]
+mod durability_tests;
 mod io_func;
 mod mappings;
 mod metadata;
