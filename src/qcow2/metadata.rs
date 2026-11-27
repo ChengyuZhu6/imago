@@ -161,7 +161,7 @@ struct V3HeaderBase/BE, no_gaps {
     ///    bit (incompatible feature bit 1) is also set.
     ///
     /// Bits 2-63 are reserved (set to 0).
-    autoclear_features: u64[16],
+    autoclear_features: AtomicU64[16],
 
     /// Describes the width of a reference count block entry (width in bits: `refcount_bits = 1 <<
     /// refcount_order`).  For version 2 images, the order is always assumed to be 4 (i.e.
@@ -179,7 +179,7 @@ impl Default for V3HeaderBase {
         V3HeaderBase {
             incompatible_features: 0,
             compatible_features: 0,
-            autoclear_features: 0,
+            autoclear_features: 0.into(),
             refcount_order: 4,
             header_length: (V2Header::ON_DISK_SIZE + V3HeaderBase::ON_DISK_SIZE) as u32,
         }
@@ -321,14 +321,35 @@ pub(super) struct Header {
 
     /// Whether an external data file is required.
     external_data_file: bool,
+
+    /// In-memory only: an immediate metadata pointer publication failed or was cancelled.
+    publication_failed: AtomicBool,
+
+    /// Serialize mutable header publications, including aligned RMW writes.
+    pub(super) publication_lock: Mutex<()>,
 }
 
 #[maybe_async]
 impl Header {
-    /// Load the qcow2 header from disk.
-    ///
-    /// If `writable` is false, do not perform any modifications (e.g. clearing auto-clear bits).
-    pub async fn load<S: Storage>(image: &S, writable: bool) -> io::Result<Self> {
+    /// Reject further operations unless the caller disarms this publication guard.
+    #[must_use]
+    pub(super) fn publication_guard(&self) -> DropGuard<impl FnOnce() + '_> {
+        DropGuard::new(|| self.publication_failed.store(true, Ordering::Release))
+    }
+
+    /// Reject this instance after an uncertain publication; reopening does not repair the disk.
+    pub fn ensure_healthy(&self) -> io::Result<()> {
+        if self.publication_failed.load(Ordering::Acquire) {
+            Err(io::Error::other(
+                "Metadata publication failed or was cancelled; close and verify the image before reopening",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Load the qcow2 header without modifying the image.
+    pub async fn load<S: Storage>(image: &S) -> io::Result<Self> {
         // TODO: More sanity checks.
         let mut header_buf = vec![0u8; V2Header::ON_DISK_SIZE];
         image.read(header_buf.as_mut_slice(), 0).await?;
@@ -337,7 +358,6 @@ impl Header {
         if header.magic != MAGIC {
             return Err(invalid_data("Not a qcow2 file"));
         }
-
         let v3header_base = if header.version == 2 {
             V3HeaderBase::default()
         } else if header.version == 3 {
@@ -506,26 +526,21 @@ impl Header {
         }
 
         let mut incompatible_features = v3header_base.incompatible_features;
-        let autoclear_features = v3header_base.autoclear_features;
 
         let external_data_file =
             incompatible_features & IncompatibleFeatures::ExternalDataFile as u64 != 0;
         incompatible_features &= !(IncompatibleFeatures::ExternalDataFile as u64);
 
-        let mut header = Header {
+        let header = Header {
             v2: header,
             v3: v3header_base,
             unknown_header_fields,
             backing_filename,
             extensions,
             external_data_file,
+            publication_failed: AtomicBool::new(false),
+            publication_lock: Mutex::default(),
         };
-
-        // No need to clear autoclear features for read-only images
-        if autoclear_features != 0 && writable {
-            header.v3.autoclear_features = 0;
-            header.write(image).await?;
-        }
 
         if incompatible_features != 0 {
             let feats = (0..64)
@@ -548,8 +563,29 @@ impl Header {
         Ok(header)
     }
 
+    /// Invalidate unsupported autoclear features before modifying image contents.
+    pub(super) async fn clear_autoclear_features<S: Storage>(&self, image: &S) -> io::Result<()> {
+        if self.v3.autoclear_features.load(Ordering::Acquire) == 0 {
+            return Ok(());
+        }
+
+        let _lock = self.publication_lock.lock().await;
+        self.ensure_healthy()?;
+        if self.v3.autoclear_features.load(Ordering::Relaxed) != 0 {
+            let mut publication = self.publication_guard();
+            image.write(&[0u8; 8][..], 88).await?;
+            // The cleared bits must be durable before later writes can invalidate the features.
+            image.flush().await?;
+            image.sync().await?;
+            self.v3.autoclear_features.store(0, Ordering::Release);
+            publication.disarm();
+        }
+        Ok(())
+    }
+
     /// Write the qcow2 header to disk.
     pub async fn write<S: Storage>(&mut self, image: &S) -> io::Result<()> {
+        self.ensure_healthy()?;
         let header_len = if self.v2.version > 2 {
             let len =
                 self.v2.on_disk_size() + self.v3.on_disk_size() + self.unknown_header_fields.len();
@@ -676,7 +712,7 @@ impl Header {
             v3: V3HeaderBase {
                 incompatible_features,
                 compatible_features: 0,
-                autoclear_features: 0,
+                autoclear_features: 0.into(),
                 refcount_order,
                 header_length: 0, // will be set by `Self::write()`
             },
@@ -684,6 +720,8 @@ impl Header {
             backing_filename,
             extensions,
             external_data_file: has_external_data_file,
+            publication_failed: AtomicBool::new(false),
+            publication_lock: Mutex::default(),
         }
     }
 
@@ -719,7 +757,13 @@ impl Header {
         check_field!(v2.snapshots_offset)?; // TODO: Should be mutable
         check_field!(v3.incompatible_features)?; // TODO: Should be mutable
         check_field!(v3.compatible_features)?; // TODO: Should be mutable
-        check_field!(v3.autoclear_features)?; // TODO: Should be mutable
+        if self.v3.autoclear_features.load(Ordering::Relaxed)
+            != new_header.v3.autoclear_features.load(Ordering::Relaxed)
+        {
+            return Err(io::Error::other(
+                "Incompatible autoclear feature modification",
+            ));
+        }
         check_field!(v3.refcount_order)?;
         // header length is OK to ignore (as long as it’s valid)
 
@@ -977,25 +1021,24 @@ impl Header {
         Ok(result)
     }
 
-    /// Helper for functions that just need to change little bits in the v2 header part.
     async fn write_v2_header<S: Storage>(&self, image: &S) -> io::Result<()> {
         let v2_header = encode_binary(&self.v2)?;
         image.write(&v2_header, 0).await
     }
 
-    /// Write the refcount table pointer (offset and size) to disk.
+    /// Write the refcount table pointer (offset and size) under the caller's publication lock.
     pub async fn write_reftable_pointer<S: Storage>(&self, image: &S) -> io::Result<()> {
         // TODO: Just write the reftable offset and size
         self.write_v2_header(image).await
     }
 
-    /// Write the L1 table pointer (offset and size) to disk.
+    /// Write the L1 table pointer (offset and size) under the caller's publication lock.
     pub async fn write_l1_table_pointer<S: Storage>(&self, image: &S) -> io::Result<()> {
         // TODO: Just write the L1 table offset and size
         self.write_v2_header(image).await
     }
 
-    /// Write the guest disk size to disk.
+    /// Publish the guest disk size, rejecting further operations if the write is uncertain.
     pub async fn write_size<S: Storage>(&self, image: &S) -> io::Result<()> {
         // TODO: Just write the size
         self.write_v2_header(image).await

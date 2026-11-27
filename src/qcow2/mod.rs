@@ -108,7 +108,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         writable: bool,
         storage_open_options: StorageOpenOptions,
     ) -> io::Result<Self> {
-        let header = Arc::new(Header::load(&metadata, writable).await?);
+        let header = Arc::new(Header::load(&metadata).await?);
 
         let cb = header.cluster_bits();
         let l1_offset = header.l1_table_offset();
@@ -407,6 +407,14 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             .ok_or_else(|| io::Error::other("Image is read-only"))
     }
 
+    async fn prepare_write(&self) -> io::Result<()> {
+        self.header.ensure_healthy()?;
+        self.need_writable()?;
+        self.header
+            .clear_autoclear_features(self.metadata.as_ref())
+            .await
+    }
+
     /// Check whether `offset + length` is within the disk size.
     fn check_disk_bounds<D: Display>(&self, offset: u64, length: u64, req: D) -> io::Result<()> {
         let size = self.header.size();
@@ -522,7 +530,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
             return Ok(PreparedDataMapping::existing(self.storage(), 0, 0));
         }
 
-        self.need_writable()?;
+        self.prepare_write().await?;
         let (host_offset, length, state) = self
             .do_prepare_data_mapping(GuestOffset(offset), length, overwrite, false)
             .await?;
@@ -558,7 +566,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
     }
 
     async fn ensure_zero_mapping(&self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
-        self.need_writable()?;
+        self.prepare_write().await?;
         self.check_disk_bounds(offset, length, "write")?;
 
         self.ensure_fixed_mapping(
@@ -575,7 +583,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         offset: u64,
         length: u64,
     ) -> io::Result<(u64, u64)> {
-        self.need_writable()?;
+        self.prepare_write().await?;
         self.check_disk_bounds(offset, length, "discard")?;
 
         // Safe to discard: We have a mutable `self` reference
@@ -600,7 +608,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         offset: u64,
         length: u64,
     ) -> io::Result<(u64, u64)> {
-        self.need_writable()?;
+        self.prepare_write().await?;
         self.check_disk_bounds(offset, length, "discard")?;
 
         // Safe to discard: We have a mutable `self` reference
@@ -677,7 +685,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         // the time being, all we need to reload are things that are mutable at runtime anyway
         // (because the source instance would not have been able to change other things), so just
         // reload the L1 and refcount table positions.
-        let new_header = Header::load(self.metadata.as_ref(), false).await?;
+        let new_header = Header::load(self.metadata.as_ref()).await?;
         self.header.update(&new_header)?;
 
         if let Some(allocator) = self.allocator.as_ref() {
@@ -708,7 +716,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
     }
 
     async fn resize_grow(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
-        self.need_writable()?;
+        self.prepare_write().await?;
 
         let old_size = self.size();
         let grown_length = new_size.saturating_sub(old_size);
@@ -782,7 +790,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
     }
 
     async fn resize_shrink(&mut self, new_size: u64) -> io::Result<()> {
-        self.need_writable()?;
+        self.prepare_write().await?;
 
         let old_size = self.size();
         if new_size >= old_size {
