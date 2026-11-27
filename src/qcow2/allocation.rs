@@ -983,6 +983,192 @@ impl<S: Storage> Allocator<S> {
 mod tests {
     use super::*;
     use crate::null::Null;
+    use crate::test::mem_storage::{create_image, MemStorage, MemStorageState};
+    use std::sync::atomic::Ordering;
+
+    /// Exercise one metadata publication site.
+    #[maybe_async]
+    async fn publish_metadata(qcow2: &Qcow2<MemStorage>, site: usize) -> io::Result<()> {
+        match site {
+            0 => qcow2.ensure_l2(GuestOffset(0)).await.map(|_| ()),
+            1 => qcow2.allocator().await?.ensure_rb(1).await.map(|_| ()),
+            2 => {
+                let l1 = qcow2.l1_table.write().await;
+                let index = l1.entries();
+                qcow2.grow_l1_table(l1, index).await.map(|_| ())
+            }
+            3 => {
+                let index = qcow2.header.reftable_entries();
+                qcow2.allocator().await?.grow_reftable(index).await
+            }
+            4 => {
+                qcow2
+                    .header
+                    .write_size(qcow2.metadata.as_ref(), qcow2.size() + 512)
+                    .await
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_metadata_publication_fail_closed() -> io::Result<()> {
+        #[cfg(feature = "sync")]
+        let cancellation_modes = [false];
+        #[cfg(feature = "async")]
+        let cancellation_modes = [false, true];
+        for site in 0..5 {
+            for cancel in cancellation_modes {
+                let state = Arc::new(MemStorageState::default());
+                let qcow2 = create_image(&state, 64 * 1024).await;
+                let prepared = qcow2.prepare_data_mapping(32 * 1024, 512, true).await?;
+                let pending = qcow2.allocate_meta_cluster().await?;
+                let cluster = pending.cluster();
+                let (rt_index, rb_index) = cluster.rt_rb_indices(qcow2.header.rb_bits());
+                let rb = qcow2.allocator().await?.get_rb(rt_index).await?.unwrap();
+                qcow2.flush().await?;
+                let offset = match site {
+                    0 => qcow2.header.l1_table_offset().0,
+                    1 => qcow2.header.reftable_offset().0 + 8,
+                    _ => 0,
+                };
+                let before = state.data.lock()[offset as usize..offset as usize + 8].to_vec();
+                if cancel {
+                    #[cfg(feature = "async")]
+                    {
+                        *state.hold_range.lock() = Some(offset..offset + 8);
+                        state.hold_writes.store(true, Ordering::Relaxed);
+                        let mut publication = Box::pin(publish_metadata(&qcow2, site));
+                        assert!(
+                            crate::test::mem_storage::poll_once(publication.as_mut()).is_pending()
+                        );
+                        assert_eq!(state.held.lock()[0].0, offset);
+                        let waiter_site = if site == 2 { 3 } else { site };
+                        let mut waiter = Box::pin(publish_metadata(&qcow2, waiter_site));
+                        assert!(crate::test::mem_storage::poll_once(waiter.as_mut()).is_pending());
+                        assert_eq!(state.held.lock().len(), 1);
+                        drop(publication);
+                        waiter.await.err().unwrap();
+                    }
+                } else {
+                    *state.fail_write_offset.lock() = Some(offset);
+                    publish_metadata(&qcow2, site).await.err().unwrap();
+                    assert_eq!(*state.failed.lock(), [offset]);
+                }
+                assert_eq!(
+                    &state.data.lock()[offset as usize..offset as usize + 8],
+                    before.as_slice()
+                );
+                assert!(qcow2.header.ensure_healthy().is_err());
+                assert_eq!(qcow2.size(), 64 * 1024);
+                qcow2.commit_data_mapping(prepared).await.unwrap_err();
+                qcow2
+                    .resize_grow(4 * 1024 * 1024, PreallocateMode::None)
+                    .await
+                    .unwrap_err();
+                qcow2.get_mapping(0, 512).await.err().unwrap();
+                qcow2.flush().await.unwrap_err();
+                qcow2.sync().await.unwrap_err();
+                drop(pending);
+                qcow2.process_clusters_to_free().await;
+                let mut allocator = qcow2.allocator.as_ref().unwrap().lock().await;
+                allocator.process_clusters_to_free().await;
+                allocator
+                    .free_clusters(cluster, ClusterCount(1), false)
+                    .await;
+                assert_eq!(rb.get(rb_index), 1);
+                allocator.allocate_cluster_at(cluster).await.unwrap_err();
+                drop(allocator);
+                #[cfg(feature = "async")]
+                if cancel {
+                    state.complete_held_writes();
+                    state.release_held_writes();
+                    qcow2.flush().await.unwrap_err();
+                    qcow2.get_mapping(0, 512).await.err().unwrap();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_metadata_publication_cache_write_retryable() -> io::Result<()> {
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = create_image(&state, 64 * 1024).await;
+        for (offset, fail_sync) in [(0, false), (32768, true)] {
+            state.fail_next_write.store(!fail_sync, Ordering::Relaxed);
+            state.fail_next_sync.store(fail_sync, Ordering::Relaxed);
+            qcow2.ensure_l2(GuestOffset(offset)).await.err().unwrap();
+            let l1_offset = (qcow2.header.l1_table_offset().0 + offset / 32768 * 8) as usize;
+            assert_eq!(&state.data.lock()[l1_offset..l1_offset + 8], &[0; 8]);
+            qcow2.header.ensure_healthy().unwrap();
+            qcow2.ensure_data_mapping(offset, 512, true).await?;
+            qcow2.flush().await?;
+        }
+        let rb_offset = state.read_u64(qcow2.header.reftable_offset().0);
+        qcow2.ensure_data_mapping(512, 512, true).await?;
+        qcow2.ensure_zero_mapping(0, 512).await?;
+        *state.fail_write_offset.lock() = Some(rb_offset);
+        qcow2.flush().await.unwrap_err();
+        qcow2.header.ensure_healthy().unwrap();
+        qcow2.flush().await?;
+        qcow2.ensure_data_mapping(0, 512, true).await?;
+        qcow2.flush().await?;
+        Ok(())
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn test_metadata_publication_private_rb_and_serialized_header() -> io::Result<()> {
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = create_image(&state, 64 * 1024).await;
+        let index = qcow2.header.reftable_entries();
+        let cluster = HostCluster::from_ref_indices(index, 0, qcow2.header.rb_bits());
+        qcow2.allocator().await?.first_free_cluster = cluster;
+        qcow2.flush().await?;
+        let offset = cluster.offset(qcow2.header.cluster_bits()).0;
+        *state.hold_range.lock() = Some(offset..offset + 512);
+        state.hold_writes.store(true, Ordering::Relaxed);
+        let mut preparation = Box::pin(publish_metadata(&qcow2, 3));
+        assert!(crate::test::mem_storage::poll_once(preparation.as_mut()).is_pending());
+        assert_eq!(state.held.lock()[0].0, offset);
+        drop(preparation);
+        state.complete_held_writes();
+        state.release_held_writes();
+        let reused = [0x5a; 512];
+        state.write(offset, &reused);
+        qcow2.caches.flush_rb().await.unwrap_err();
+        assert_eq!(
+            &state.data.lock()[offset as usize..offset as usize + 512],
+            &reused
+        );
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = create_image(&state, 64 * 1024).await;
+        qcow2.flush().await?;
+        *state.hold_range.lock() = Some(0..512);
+        state.hold_writes.store(true, Ordering::Relaxed);
+        let mut l1_publication = Box::pin(publish_metadata(&qcow2, 2));
+        assert!(crate::test::mem_storage::poll_once(l1_publication.as_mut()).is_pending());
+        let mut rt_publication = Box::pin(publish_metadata(&qcow2, 3));
+        assert!(crate::test::mem_storage::poll_once(rt_publication.as_mut()).is_pending());
+        let new_size = qcow2.size() + 512;
+        let mut size_publication =
+            Box::pin(qcow2.header.write_size(qcow2.metadata.as_ref(), new_size));
+        assert!(crate::test::mem_storage::poll_once(size_publication.as_mut()).is_pending());
+        assert_eq!(state.held.lock().len(), 1);
+        state.release_held_writes();
+        l1_publication.await?;
+        rt_publication.await?;
+        size_publication.await?;
+        let reopened = Header::load(qcow2.metadata.as_ref()).await?;
+        assert_eq!(reopened.size(), new_size);
+        assert_eq!(reopened.l1_table_offset(), qcow2.header.l1_table_offset());
+        assert_eq!(reopened.l1_table_entries(), qcow2.header.l1_table_entries());
+        assert_eq!(reopened.reftable_offset(), qcow2.header.reftable_offset());
+        assert_eq!(reopened.reftable_entries(), qcow2.header.reftable_entries());
+        qcow2.flush().await?;
+        Ok(())
+    }
 
     /// Regression test for a bug in `Allocator::grow_reftable()`'s free-space search loop: when it
     /// hit a reftable index that had no refblock at all (i.e. a range that has never been

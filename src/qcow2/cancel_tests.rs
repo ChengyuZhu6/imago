@@ -88,43 +88,22 @@ async fn test_dropped_write_vs_discard_and_realloc() {
 async fn test_dropped_l1_entry_write_vs_l1_growth_and_realloc() {
     let state = Arc::new(MemStorageState::default());
     let mut image = create_image(&state, 64 * 1024).await;
-
-    // L1 table offset from the image header
-    let l1_offset = u64::from_be_bytes(state.data.lock()[40..48].try_into().unwrap());
-    assert_ne!(l1_offset, 0);
-
-    // Issue a write to guest cluster 0, which allocates an L2 table, and drop its future while its
-    // L1 entry write is still in flight
-    *state.hold_range.lock() = Some(l1_offset..(l1_offset + 512));
+    let l1_offset = read_u64(&state, 40);
+    *state.hold_range.lock() = Some(l1_offset..l1_offset + 512);
     state.hold_writes.store(true, Ordering::Relaxed);
-    assert!(image.write(&[0x22u8; 512][..], 0).now_or_never().is_none());
+    let mut write = Box::pin(image.write(&[0x22u8; 512][..], 0));
+    assert!(crate::test::mem_storage::poll_once(write.as_mut()).is_pending());
     assert_eq!(state.held.lock().len(), 1);
+    drop(write);
     state.hold_writes.store(false, Ordering::Relaxed);
     *state.hold_range.lock() = None;
-
-    // Grow the L1 table beyond its first cluster (64 entries of 32 KiB each), freeing the old one
     image
         .resize(4 * 1024 * 1024, PreallocateMode::None)
         .await
-        .unwrap();
-
-    // Allocate guest cluster 1 (whose L2 table exists already), which must reuse the old L1
-    // table’s cluster for this test to be meaningful
-    let new_data = [0x33u8; 512];
-    image.write(&new_data[..], 512).await.unwrap();
-    assert_eq!(host_offset(&image, 512).await, l1_offset);
-
-    // Now the dropped L1 entry write completes (unless it has already been settled before)
+        .unwrap_err();
+    image.write(&[0x33u8; 512][..], 512).await.unwrap_err();
     state.complete_held_writes();
-
-    let mut buf = [0u8; 512];
-    image.read(&mut buf[..], 512).await.unwrap();
-    assert!(
-        buf == new_data,
-        "Expected {:#04x} bytes, read {:#04x} bytes",
-        new_data[0],
-        buf[0],
-    );
+    image.flush().await.unwrap_err();
 }
 
 /// Return the cluster-aligned host offset (assuming a cluster size of 512) of the first held
@@ -649,4 +628,49 @@ async fn test_parallel_write_with_several_allocations() {
     let mut buf = [0u8; 2 * 512];
     image.read(&mut buf[..], 4 * 512).await.unwrap();
     assert!(buf == [0x55u8; 2 * 512], "Data not read back correctly");
+}
+
+#[tokio::test]
+async fn test_cancelled_resize_rejects_retry() -> io::Result<()> {
+    for (new_size, late_write, expected_size) in [
+        (1536, false, 2048),
+        (1536, true, 1536),
+        (2560, false, 2048),
+        (2560, true, 2048),
+    ] {
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = crate::test::mem_storage::create_image(&state, 2048).await;
+        let metadata = Arc::clone(&qcow2.metadata);
+        let mut image = FormatAccess::new(qcow2);
+        image.write(&[0x5au8; 512][..], 0).await?;
+        image.flush().await?;
+        *state.hold_range.lock() = Some(0..72);
+        state.hold_writes.store(late_write, Ordering::Relaxed);
+        let blocker = if late_write {
+            None
+        } else {
+            Some(metadata.strong_write_blocker(0..72).await)
+        };
+        assert!(image
+            .resize(new_size, PreallocateMode::None)
+            .now_or_never()
+            .is_none());
+        state.hold_writes.store(false, Ordering::Relaxed);
+        drop(blocker);
+        assert_eq!(image.size(), 2048);
+        image
+            .resize(new_size, PreallocateMode::None)
+            .await
+            .unwrap_err();
+        image.sync().await.unwrap_err();
+        state.complete_held_writes();
+        image.flush().await.unwrap_err();
+        drop(image);
+        let reopened = open_image(&state).await;
+        assert_eq!(reopened.size(), expected_size);
+        let mut buf = [0; 512];
+        reopened.read(&mut buf[..], 0).await?;
+        assert_eq!(buf, [0x5a; 512]);
+    }
+    Ok(())
 }
