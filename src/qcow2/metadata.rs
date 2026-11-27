@@ -3273,4 +3273,92 @@ mod tests {
             .count();
         assert_eq!(clobbered, 0, "bytes after the L1 table were overwritten");
     }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn header_validation_preserves_image() -> io::Result<()> {
+        let error =
+            HeaderExtension::deserialize(HeaderExtensionType::FeatureNameTable as u32, vec![0; 47])
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        for (backing, external, encryption, incompatible) in [
+            (Some("base.raw"), None, 0, 0),
+            (None, Some("data.raw"), 0, 0),
+            (None, None, 1, 0),
+            (None, None, 0, 1),
+            (None, None, 0, 1 << 63),
+        ] {
+            let dependencies = backing.is_some() || external.is_some();
+            let state = Arc::new(MemStorageState::default());
+            let image = MemStorage::new(Arc::clone(&state), false);
+            let mut header = Header::new(
+                16,
+                4,
+                backing.map(str::to_owned),
+                None,
+                external.map(str::to_owned),
+            );
+            header.v2.crypt_method = encryption;
+            header.v3.incompatible_features |= incompatible;
+            header
+                .v3
+                .autoclear_features
+                .store(1 << 63, Ordering::Relaxed);
+            header.write(&image).await?;
+            let original = state.data.lock().clone();
+            let result = Header::load(&image).await;
+            if dependencies {
+                let loaded = result?;
+                assert_eq!(loaded.backing_filename().map(String::as_str), backing);
+                assert_eq!(loaded.external_data_file(), external.is_some());
+            } else {
+                assert_eq!(result.err().unwrap().kind(), io::ErrorKind::InvalidData);
+            }
+            assert_eq!(*state.data.lock(), original);
+        }
+        Ok(())
+    }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn autoclear_publication_failure_rejects_retry() -> io::Result<()> {
+        for align in [1, 4096] {
+            for delayed in [false, true] {
+                if delayed && !cfg!(feature = "async") {
+                    continue;
+                }
+                let state = Arc::new(MemStorageState::default());
+                let image = MemStorage::new(Arc::clone(&state), false).with_align(align);
+                let mut header = Header::new(9, 4, None, None, None);
+                header
+                    .v3
+                    .autoclear_features
+                    .store(1 << 63, Ordering::Relaxed);
+                header.write(&image).await?;
+                let write_offset = 88 & !(align as u64 - 1);
+
+                if delayed {
+                    #[cfg(feature = "async")]
+                    {
+                        state.hold_writes.store(true, Ordering::Relaxed);
+                        *state.hold_range.lock() = Some(88..96);
+                        let mut clear = Box::pin(header.clear_autoclear_features(&image));
+                        assert!(crate::test::mem_storage::poll_once(clear.as_mut()).is_pending());
+                        drop(clear);
+                        state.hold_writes.store(false, Ordering::Relaxed);
+                    }
+                } else {
+                    *state.fail_write_offset.lock() = Some(write_offset);
+                    header.clear_autoclear_features(&image).await.unwrap_err();
+                }
+                header.clear_autoclear_features(&image).await.unwrap_err();
+                header.write_size(&image, 512).await.unwrap_err();
+                #[cfg(feature = "async")]
+                state.complete_held_writes();
+                header.ensure_healthy().unwrap_err();
+                let reopened = Header::load(&image).await?;
+                assert_eq!(reopened.size(), 0);
+            }
+        }
+        Ok(())
+    }
 }
