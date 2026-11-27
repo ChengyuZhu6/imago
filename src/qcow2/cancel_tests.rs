@@ -77,54 +77,28 @@ async fn test_dropped_write_vs_discard_and_realloc() {
     );
 }
 
-/// A metadata table entry write whose future is dropped while it is still in flight must not
-/// overwrite data in a cluster that has been freed (by replacing the table) and reallocated in the
-/// meantime.
-///
-/// Here, the table is the L1 table: Dropping a guest write while its L1 entry write is in flight
-/// releases the L1 table lock, so growing the image can then replace the L1 table, freeing the old
-/// one.
+/// Cancelled immediate L1 publication stops table replacement and cluster reuse
+/// until the image has been verified and reopened.
 #[tokio::test]
 async fn test_dropped_l1_entry_write_vs_l1_growth_and_realloc() {
     let state = Arc::new(MemStorageState::default());
     let mut image = create_image(&state, 64 * 1024).await;
-
-    // L1 table offset from the image header
-    let l1_offset = u64::from_be_bytes(state.data.lock()[40..48].try_into().unwrap());
-    assert_ne!(l1_offset, 0);
-
-    // Issue a write to guest cluster 0, which allocates an L2 table, and drop its future while its
-    // L1 entry write is still in flight
-    *state.hold_range.lock() = Some(l1_offset..(l1_offset + 512));
+    let l1_offset = read_u64(&state, 40);
+    *state.hold_range.lock() = Some(l1_offset..l1_offset + 512);
     state.hold_writes.store(true, Ordering::Relaxed);
-    assert!(image.write(&[0x22u8; 512][..], 0).now_or_never().is_none());
+    let mut write = Box::pin(image.write(&[0x22u8; 512][..], 0));
+    assert!(crate::test::mem_storage::poll_once(write.as_mut()).is_pending());
     assert_eq!(state.held.lock().len(), 1);
+    drop(write);
     state.hold_writes.store(false, Ordering::Relaxed);
     *state.hold_range.lock() = None;
-
-    // Grow the L1 table beyond its first cluster (64 entries of 32 KiB each), freeing the old one
     image
         .resize(4 * 1024 * 1024, PreallocateMode::None)
         .await
-        .unwrap();
-
-    // Allocate guest cluster 1 (whose L2 table exists already), which must reuse the old L1
-    // table’s cluster for this test to be meaningful
-    let new_data = [0x33u8; 512];
-    image.write(&new_data[..], 512).await.unwrap();
-    assert_eq!(host_offset(&image, 512).await, l1_offset);
-
-    // Now the dropped L1 entry write completes (unless it has already been settled before)
+        .unwrap_err();
+    image.write(&[0x33u8; 512][..], 512).await.unwrap_err();
     state.complete_held_writes();
-
-    let mut buf = [0u8; 512];
-    image.read(&mut buf[..], 512).await.unwrap();
-    assert!(
-        buf == new_data,
-        "Expected {:#04x} bytes, read {:#04x} bytes",
-        new_data[0],
-        buf[0],
-    );
+    image.flush().await.unwrap_err();
 }
 
 /// Return the cluster-aligned host offset (assuming a cluster size of 512) of the first held

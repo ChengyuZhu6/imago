@@ -146,12 +146,15 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     ///
     /// Returns an error for read-only images.
     async fn allocator(&self) -> io::Result<MutexGuard<'_, Allocator<S>>> {
-        Ok(self
+        self.header.ensure_healthy()?;
+        let allocator = self
             .allocator
             .as_ref()
             .ok_or_else(|| io::Error::other("Image is read-only"))?
             .lock()
-            .await)
+            .await;
+        self.header.ensure_healthy()?;
+        Ok(allocator)
     }
 
     /// Allocate one metadata cluster.
@@ -308,6 +311,8 @@ impl<S: Storage> Allocator<S> {
         })
     }
 
+
+
     /// Free all clusters in `self.clusters_to_free` (i.e. decrement their refcount).
     ///
     /// Must not be called while allocating clusters: Freeing data clusters requires the refblock
@@ -388,6 +393,7 @@ impl<S: Storage> Allocator<S> {
         end_cluster: Option<HostCluster>,
         metadata: bool,
     ) -> io::Result<PendingClusters> {
+        self.header.ensure_healthy()?;
         let mut index = self.first_free_cluster;
         loop {
             if end_cluster == Some(index) {
@@ -461,7 +467,8 @@ impl<S: Storage> Allocator<S> {
                 // Already allocated, or some real error occurred; free everything allocated so far.
                 // Do not go through `self.clusters_to_free`: As described above, the freed range
                 // must be available for allocation immediately, so that retrying converges.
-                self.free_clusters(start_index, index - start_index).await;
+                self.free_clusters(start_index, index - start_index)
+                    .await;
                 return result.map(|_| index - start_index);
             }
 
@@ -477,11 +484,13 @@ impl<S: Storage> Allocator<S> {
     /// Return `Ok(true)` if allocation was successful, or `Ok(false)` if the cluster was already
     /// allocated before.
     async fn allocate_cluster_at(&mut self, index: HostCluster) -> io::Result<bool> {
+        self.header.ensure_healthy()?;
         let rb_bits = self.header.rb_bits();
         let (rt_index, rb_index) = index.rt_rb_indices(rb_bits);
 
         let rb = self.ensure_rb(rt_index).await?;
         let mut rb = rb.lock_write().await;
+        self.header.ensure_healthy()?;
         let can_allocate = rb.is_zero(rb_index);
         if can_allocate {
             rb.increment(rb_index)?;
@@ -499,6 +508,7 @@ impl<S: Storage> Allocator<S> {
     ///
     /// If there is no refblock for the given reftable index, return `Ok(None)`.
     async fn get_rb(&mut self, rt_index: usize) -> io::Result<Option<Arc<RefBlock>>> {
+        self.header.ensure_healthy()?;
         let rt_entry = self.reftable.get(rt_index);
         if let Some(rb_offset) = rt_entry.refblock_offset() {
             let cb = self.header.cluster_bits();
@@ -548,6 +558,7 @@ impl<S: Storage> Allocator<S> {
         #[cfg(feature = "sync")]
         let alloc_result = alloc_fut_or_result;
 
+        self.header.ensure_healthy()?;
         let new_rb_allocation = if let Ok(new_rb_allocation) = alloc_result {
             new_rb.set_cluster(new_rb_allocation.cluster());
             Some(new_rb_allocation)
@@ -558,13 +569,25 @@ impl<S: Storage> Allocator<S> {
             new_rb.lock_write().await.increment(0)?;
             None
         };
-        new_rb.write(self.file.as_ref()).await?;
+        if new_rb_allocation.is_none() {
+            let mut initialization = self.header.publication_guard();
+            let result = new_rb.write(self.file.as_ref()).await;
+            initialization.disarm();
+            result?;
+        } else {
+            new_rb.write(self.file.as_ref()).await?;
+        }
+        self.caches.flush_rb().await?;
 
+        self.header.ensure_healthy()?;
         self.reftable
             .enter_refblock(rt_index, &new_rb, new_rb_allocation)?;
+        let mut publication = self.header.publication_guard();
         self.reftable
             .write_entry(self.file.as_ref(), rt_index)
             .await?;
+        self.header.ensure_healthy()?;
+        publication.disarm();
 
         let new_rb = Arc::new(new_rb);
         self.caches.rb_insert(Arc::clone(&new_rb)).await?;
@@ -577,6 +600,7 @@ impl<S: Storage> Allocator<S> {
     /// ensure it is refcounted itself (also creating new refblocks if necessary), and have the
     /// image header reference the new refcount table.
     async fn grow_reftable(&mut self, at_least_index: usize) -> io::Result<()> {
+        self.header.ensure_healthy()?;
         let cb = self.header.cluster_bits();
         let rb_bits = self.header.rb_bits();
         let rb_entries = 1 << rb_bits;
@@ -640,22 +664,20 @@ impl<S: Storage> Allocator<S> {
         let rt_index_start = index.rt_index(rb_bits);
         let rt_index_end = (index + count).0.div_ceil(rb_entries as u64) as usize;
 
-        let mut refblocks = Vec::<Arc<RefBlock>>::new();
+        let mut refblocks = Vec::<(Arc<RefBlock>, bool)>::new();
         for rt_i in rt_index_start..rt_index_end {
             if let Some(rb_offset) = new_rt.get(rt_i).refblock_offset() {
                 // Checked in the loop above
                 let rb_cluster = rb_offset.checked_cluster(cb).unwrap();
                 let rb = self.caches.rb_get_or_insert(rb_cluster).await?;
-                refblocks.push(rb);
+                refblocks.push((rb, false));
                 continue;
             }
 
             let mut rb = RefBlock::new_cleared(self.file.as_ref(), &self.header)?;
             rb.set_cluster(index);
             new_rt.enter_refblock(rt_i, &rb, None)?;
-            let rb = Arc::new(rb);
-            self.caches.rb_insert(Arc::clone(&rb)).await?;
-            refblocks.push(rb);
+            refblocks.push((Arc::new(rb), true));
             index += ClusterCount(1);
             count -= ClusterCount(1);
         }
@@ -675,6 +697,7 @@ impl<S: Storage> Allocator<S> {
             let rb_vec_i = rt_i - rt_index_start;
             // Incrementing from 0 to 1 must succeed
             refblocks[rb_vec_i]
+                .0
                 .lock_write()
                 .await
                 .increment(rb_i)
@@ -685,8 +708,18 @@ impl<S: Storage> Allocator<S> {
         // `refblocks` that are already part of the old reftable.
         // TODO: Try to clean that up, though it seems quite hard for little gain.
         self.caches.flush_rb().await?;
+        let mut publication = self.header.publication_guard();
+        for (rb, is_new) in &refblocks {
+            if *is_new {
+                rb.write(self.file.as_ref()).await?;
+            }
+        }
         new_rt.write(self.file.as_ref()).await?;
+        self.file.flush().await?;
+        self.file.sync().await?;
 
+        let header_locked = self.header.publication_lock.lock().await;
+        self.header.ensure_healthy()?;
         self.header.set_reftable(&new_rt)?;
         self.header
             .write_reftable_pointer(self.file.as_ref())
@@ -694,6 +727,8 @@ impl<S: Storage> Allocator<S> {
 
         // Must set new reftable before freeing the old reftable’s clusters
         let mut old_reftable = mem::replace(&mut self.reftable, new_rt);
+        publication.disarm();
+        drop(header_locked);
         if let Some(old_rt_cluster) = old_reftable.get_cluster() {
             let old_rt_size = old_reftable.cluster_count();
             old_reftable.unset_cluster();
@@ -704,7 +739,12 @@ impl<S: Storage> Allocator<S> {
                 .push(ClustersToFreeEntry::metadata(old_rt_cluster, old_rt_size));
         }
 
-        Ok(())
+        for (rb, is_new) in refblocks {
+            if is_new {
+                self.caches.rb_insert(rb).await?;
+            }
+        }
+        self.header.ensure_healthy()
     }
 
     /// Free clusters (i.e. decrement their refcount).

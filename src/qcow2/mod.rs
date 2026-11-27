@@ -190,6 +190,8 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         Self::do_open(metadata, writable, StorageOpenOptions::new()).await
     }
 
+
+
     /// Does this qcow2 image require an external data file?
     ///
     /// Conversely, if this is `false`, this image must not use an external data file.
@@ -239,6 +241,8 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         self.backing_set = true;
     }
 
+
+
     /// Get the data storage object.
     ///
     /// If we have an external data file, return that.  Otherwise, return the image (metadata)
@@ -270,7 +274,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         let opts = self
             .storage_open_options
             .clone()
-            .write(true)
+            .write(self.writable)
             .filename(absolute.clone());
 
         let file = gate
@@ -377,9 +381,8 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         mut gate: G,
     ) -> io::Result<()> {
         if !self.storage_set {
-            self.storage = self.open_implicit_data_file(&mut gate).await?.map(Arc::new);
-            self.caches.set_data_file(self.storage.clone());
-            self.storage_set = true;
+            let file = self.open_implicit_data_file(&mut gate).await?;
+            self.set_data_file(file);
         }
 
         if !self.backing_set {
@@ -409,6 +412,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             .ok_or_else(|| io::Error::other("Image is read-only"))
     }
 
+    /// Require write access and invalidate autoclear features before modifying the image.
     async fn prepare_write(&self) -> io::Result<()> {
         self.header.ensure_healthy()?;
         self.need_writable()?;
@@ -509,6 +513,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         offset: u64,
         max_length: u64,
     ) -> io::Result<(ShallowMapping<'a, S>, u64)> {
+        self.header.ensure_healthy()?;
         let length_until_eof = match self.header.size().checked_sub(offset) {
             None | Some(0) => return Ok((ShallowMapping::Eof {}, 0)),
             Some(length) => length,
@@ -516,7 +521,8 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
 
         let max_length = cmp::min(max_length, length_until_eof);
         let offset = GuestOffset(offset);
-        self.do_get_mapping(offset, max_length).await
+        let (mapping, length) = self.do_get_mapping(offset, max_length).await?;
+        Ok((mapping, length))
     }
 
     #[allow(clippy::needless_lifetimes)] // Elidable in sync, but async needs a named lifetime for the boxed future bound
@@ -526,6 +532,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         length: u64,
         overwrite: bool,
     ) -> io::Result<PreparedDataMapping<'a, S>> {
+        self.header.ensure_healthy()?;
         self.check_disk_bounds(offset, length, "allocate")?;
 
         if length == 0 {
@@ -533,9 +540,10 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         }
 
         self.prepare_write().await?;
-        let (host_offset, length, state) = self
+        let (host_offset, mapped_length, state) = self
             .do_prepare_data_mapping(GuestOffset(offset), length, overwrite, false)
             .await?;
+        let length = mapped_length.min(length);
 
         let pdm = if let Some(state) = state {
             PreparedDataMapping::to_commit(self.storage(), host_offset, length, Box::new(state))
@@ -546,6 +554,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
     }
 
     async fn commit_data_mapping(&self, mapping: PreparedDataMapping<'_, S>) -> io::Result<()> {
+        self.header.ensure_healthy()?;
         let Some(state) = mapping.into_state() else {
             // Mapped already
             return Ok(());
@@ -564,7 +573,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
             })?;
 
         self.do_commit_data_mapping(*state).await;
-        Ok(())
+        self.header.ensure_healthy()
     }
 
     async fn ensure_zero_mapping(&self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
@@ -637,27 +646,31 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
     }
 
     async fn flush(&self) -> io::Result<()> {
+        self.header.ensure_healthy()?;
         // Free what is pending before writing back the refblocks
         self.process_clusters_to_free().await;
+        self.header.ensure_healthy()?;
         self.caches.flush_all().await?;
         self.metadata.flush().await?;
         if let Some(storage) = self.storage.as_ref() {
             storage.flush().await?;
         }
         // Backing file is read-only, so need not be flushed from us.
-        Ok(())
+        self.header.ensure_healthy()
     }
 
     async fn sync(&self) -> io::Result<()> {
+        self.header.ensure_healthy()?;
         self.metadata.sync().await?;
         if let Some(storage) = self.storage.as_ref() {
             storage.sync().await?;
         }
         // Backing file is read-only, so need not be synced from us.
-        Ok(())
+        self.header.ensure_healthy()
     }
 
     async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        self.header.ensure_healthy()?;
         // Forget clusters that were still to be freed: Freeing them would modify the image, which
         // must not happen here, and they are unused only per our outdated view of the image
         // anyway.  (If they really are unused, they are leaked.)
@@ -781,14 +794,9 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         // Now that preallocation is complete, it’s safe to actually set the new size (otherwise
         // someone might see a backing image’s data peek through briefly in case it is longer than
         // `old_size`)
-        self.header.set_size(new_size);
         self.header
-            .write_size(self.metadata.as_ref())
+            .write_size(self.metadata.as_ref(), new_size)
             .await
-            .inspect_err(|_| {
-                // Reset to old size
-                self.header.set_size(old_size)
-            })
     }
 
     async fn resize_shrink(&mut self, new_size: u64) -> io::Result<()> {
@@ -816,16 +824,9 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         }
 
         // Shrink after discarding (so we can discard)
-        self.header.set_size(new_size);
-
-        // Do this last because we may not be able to undo it
         self.header
-            .write_size(self.metadata.as_ref())
+            .write_size(self.metadata.as_ref(), new_size)
             .await
-            .inspect_err(|_| {
-                // Reset to old size
-                self.header.set_size(old_size);
-            })
     }
 }
 
