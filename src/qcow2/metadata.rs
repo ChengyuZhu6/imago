@@ -1821,6 +1821,9 @@ pub(super) struct L2Table {
     /// Serializes writing this table back to disk (see [`L2Table::write_if_modified()`]).
     writeback_lock: Mutex<()>,
 
+    /// A dropped writeback may still write its snapshot after releasing the lock.
+    writeback_cancelled: AtomicBool,
+
     /// Binds a snapshot to the payload dependency set by mapping commits.
     /// Held only while copying entries or modifying them, never across I/O.
     payload_dependency: parking_lot::Mutex<bool>,
@@ -1853,6 +1856,7 @@ impl L2Table {
             modified: true.into(),
             writer_lock: Default::default(),
             writeback_lock: Default::default(),
+            writeback_cancelled: AtomicBool::new(false),
             payload_dependency: Default::default(),
         }
     }
@@ -1908,6 +1912,11 @@ impl L2Table {
         header.ensure_healthy()?;
         let _lock = self.writeback_lock.lock().await;
         header.ensure_healthy()?;
+        if self.writeback_cancelled.load(Ordering::Relaxed) {
+            image.settle_writes().await?;
+            self.writeback_cancelled.store(false, Ordering::Relaxed);
+        }
+
         assert!(self.get_cluster().unwrap() == cluster);
         let (buffer, offset, depends_on_payload) = {
             let mut dependency = self.payload_dependency.lock();
@@ -1928,7 +1937,11 @@ impl L2Table {
             data_file.sync().await?;
         }
         header.ensure_healthy()?;
-        image.write(&buffer, offset.0).await?;
+        let mut cancelled =
+            DropGuard::new(|| self.writeback_cancelled.store(true, Ordering::Relaxed));
+        let result = image.write(&buffer, offset.0).await;
+        cancelled.disarm();
+        result?;
         header.ensure_healthy()?;
         modified.disarm();
         Ok(())
@@ -2095,6 +2108,7 @@ impl Table for L2Table {
             modified: true.into(),
             writer_lock: Default::default(),
             writeback_lock: Default::default(),
+            writeback_cancelled: AtomicBool::new(false),
             payload_dependency: Default::default(),
         }
     }
@@ -2168,6 +2182,7 @@ impl Clone for L2Table {
             modified,
             writer_lock: Default::default(),
             writeback_lock: Default::default(),
+            writeback_cancelled: AtomicBool::new(false),
             payload_dependency: parking_lot::Mutex::new(*dependency),
         }
     }
@@ -2418,6 +2433,9 @@ pub(super) struct RefBlock {
 
     /// Serializes writing this block back to disk (see [`RefBlock::write_if_modified()`]).
     writeback_lock: Mutex<()>,
+
+    /// A dropped writeback may still write its snapshot after releasing the lock.
+    writeback_cancelled: AtomicBool,
 }
 
 /// Write guard for a refblock.
@@ -2444,6 +2462,7 @@ impl RefBlock {
             modified: true.into(),
             writer_lock: Default::default(),
             writeback_lock: Default::default(),
+            writeback_cancelled: AtomicBool::new(false),
         })
     }
 
@@ -2479,6 +2498,7 @@ impl RefBlock {
             modified: false.into(),
             writer_lock: Default::default(),
             writeback_lock: Default::default(),
+            writeback_cancelled: AtomicBool::new(false),
         })
     }
 
@@ -2669,16 +2689,28 @@ impl RefBlock {
     pub async fn write_if_modified<S: Storage>(
         &self,
         image: &S,
+        header: &Header,
         cluster: HostCluster,
     ) -> io::Result<()> {
+        header.ensure_healthy()?;
         let _lock = self.writeback_lock.lock().await;
+        header.ensure_healthy()?;
 
         if !self.is_modified() {
             return Ok(());
         }
 
         assert!(self.get_cluster().unwrap() == cluster);
-        self.write(image).await
+        if self.writeback_cancelled.load(Ordering::Relaxed) {
+            image.settle_writes().await?;
+            self.writeback_cancelled.store(false, Ordering::Relaxed);
+        }
+        let mut cancelled =
+            DropGuard::new(|| self.writeback_cancelled.store(true, Ordering::Relaxed));
+        let result = self.write(image).await;
+        cancelled.disarm();
+        result?;
+        header.ensure_healthy()
     }
 
     /// Check whether this block has been modified since it was last written.
