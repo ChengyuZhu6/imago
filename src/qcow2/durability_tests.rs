@@ -224,3 +224,156 @@ async fn metadata_dependencies_survive_reordered_host_writeback() -> io::Result<
     check_power_cuts(baseline, events);
     Ok(())
 }
+
+/// The refcount barrier also makes already committed payloads in the same file durable.
+#[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+async fn l2_eviction_reuses_same_file_barrier() -> io::Result<()> {
+    let state = Arc::new(MemStorageState::default());
+    let mut qcow2 = create_image(&state, 3 * 32768).await;
+    for offset in [0, 32768, 65536] {
+        qcow2.ensure_l2(GuestOffset(offset)).await?;
+    }
+    qcow2.flush().await?;
+    qcow2.sync().await?;
+    qcow2.caches = Arc::new(MetadataCaches::new(&qcow2.metadata, &qcow2.header, 2, 32));
+    qcow2.allocator = Some(Mutex::new(
+        Allocator::new(
+            Arc::clone(&qcow2.metadata),
+            Arc::clone(&qcow2.header),
+            Arc::clone(&qcow2.caches),
+            Arc::clone(&qcow2.clusters_to_free),
+        )
+        .await?,
+    ));
+    let image = FormatAccess::new(qcow2);
+    image.write(&[0x5a; 512][..], 0).await?;
+    image.write(&[0x6b; 512][..], 32768).await?;
+    *state.events.lock() = Some(Vec::new());
+    let mut actual = [0; 512];
+    image.read(&mut actual[..], 65536).await?;
+    assert_eq!(actual, [0; 512]);
+    assert_eq!(
+        state
+            .events
+            .lock()
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, StorageEvent::Sync))
+            .count(),
+        1,
+        "same-file eviction needs only the refcount/payload barrier",
+    );
+    image.flush().await?;
+    image.sync().await?;
+    Ok(())
+}
+
+/// A successful external payload barrier can cover multiple cached table snapshots.
+#[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+async fn l2_writebacks_share_external_payload_barrier() -> io::Result<()> {
+    let metadata = Arc::new(MemStorageState::default());
+    let payload = Arc::new(MemStorageState::default());
+    let qcow2 = Qcow2::<MemStorage>::create_builder(MemStorage::new(Arc::clone(&metadata), false))
+        .size(65536)
+        .cluster_size(512)
+        .data_file(
+            "payload".into(),
+            MemStorage::new(Arc::clone(&payload), false),
+        )
+        .create_open(crate::DenyImplicitOpenGate::default(), |storage| {
+            Ok(Qcow2::<MemStorage>::builder(storage).write(true))
+        })
+        .await?;
+    qcow2.ensure_l2(GuestOffset(0)).await?;
+    qcow2.ensure_l2(GuestOffset(32768)).await?;
+    qcow2.flush().await?;
+    qcow2.sync().await?;
+    let image = FormatAccess::new(qcow2);
+    *payload.events.lock() = Some(Vec::new());
+    image.write(&[0x5a; 512][..], 0).await?;
+    image.write(&[0x6b; 512][..], 32768).await?;
+    image.flush().await?;
+    let events = payload.events.lock().take().unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, StorageEvent::Sync))
+            .count(),
+        1
+    );
+    let barrier = events
+        .iter()
+        .position(|event| matches!(event, StorageEvent::Sync))
+        .unwrap();
+    assert_eq!(
+        events[..barrier]
+            .iter()
+            .filter(|event| matches!(event, StorageEvent::Write(..)))
+            .count(),
+        2
+    );
+    image.sync().await?;
+    Ok(())
+}
+
+/// Only commits captured before a metadata barrier starts may reuse that barrier.
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn l2_commit_during_metadata_barrier_requires_payload_sync() -> io::Result<()> {
+    use crate::test::mem_storage::poll_once;
+    for cancel in [false, true] {
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = create_image(&state, 32768).await;
+        let l2 = qcow2.ensure_l2(GuestOffset(0)).await?;
+        let l2_offset = l2.get_offset().unwrap().0;
+        let image = FormatAccess::new(qcow2);
+        image.flush().await?;
+        image.sync().await?;
+        image.write(&[0x5a; 512][..], 0).await?;
+        state.hold_writes.store(true, Ordering::Relaxed);
+        let mut write = Box::pin(image.write(&[0x6b; 512][..], 512));
+        assert!(poll_once(write.as_mut()).is_pending());
+        state.hold_writes.store(false, Ordering::Relaxed);
+        *state.events.lock() = Some(Vec::new());
+        state.hold_next_sync.store(true, Ordering::Relaxed);
+        let mut flush = Box::pin(image.flush());
+        assert!(poll_once(flush.as_mut()).is_pending());
+        assert!(
+            l2.is_modified(),
+            "metadata barrier precedes the L2 snapshot"
+        );
+        state.release_held_writes();
+        write.await?;
+        if cancel {
+            drop(flush);
+            assert_eq!(
+                &state.data.lock()[l2_offset as usize..l2_offset as usize + 16],
+                &[0; 16]
+            );
+            state.release_sync.store(true, Ordering::Relaxed);
+            image.flush().await?;
+        } else {
+            state.release_sync.store(true, Ordering::Relaxed);
+            flush.await?;
+        }
+        let events = state.events.lock().take().unwrap();
+        let publication = events
+            .iter()
+            .position(|event| {
+                matches!(event,
+            StorageEvent::Write(offset, _) if *offset == l2_offset)
+            })
+            .unwrap();
+        assert_eq!(
+            events[..publication]
+                .iter()
+                .filter(|event| matches!(event, StorageEvent::Sync))
+                .count(),
+            if cancel { 1 } else { 2 },
+            "a late commit needs its own payload barrier; a cancelled barrier earns no credit"
+        );
+        image.sync().await?;
+    }
+    Ok(())
+}
