@@ -192,6 +192,22 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 
 
 
+    /// Check active metadata ownership without modifying the image.
+    pub async fn validate_active_metadata(&self) -> io::Result<()> {
+        self.need_writable()?;
+        if self.requires_external_data_file() {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+        let l1 = self.l1_table.read().await;
+        self.allocator
+            .as_ref()
+            .unwrap()
+            .lock()
+            .await
+            .validate_active_metadata(&l1)
+            .await
+    }
+
     /// Does this qcow2 image require an external data file?
     ///
     /// Conversely, if this is `false`, this image must not use an external data file.

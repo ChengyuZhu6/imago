@@ -1560,7 +1560,7 @@ impl L2Entry {
     /// references.
     ///
     /// `external_data_file` must be true when using an external data file.
-    fn allocation(
+    pub(super) fn allocation(
         &self,
         cluster_bits: u32,
         external_data_file: bool,
